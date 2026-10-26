@@ -1,0 +1,12 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.bak*
+*.backup*
+patch_*.py
+data/
+spook-local/
+archive/
