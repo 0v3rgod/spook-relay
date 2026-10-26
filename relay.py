@@ -1,6 +1,5 @@
 import requests
 import uuid
-import io
 from flask import Flask, request, send_file
 from flask_socketio import SocketIO, emit
 from pathlib import Path
@@ -10,7 +9,6 @@ import os
 import json
 import hub_store
 import fcntl
-from datetime import datetime, timezone
 
 
 # Load .env for Groq keys
@@ -29,184 +27,109 @@ def _carregar_env(p: Path):
 _ENV = _carregar_env(Path(__file__).resolve().parent / ".env")
 GROQ_API_KEY = _ENV.get("GROQ_API_KEY", "")
 GROQ_MODEL = _ENV.get("GROQ_MODEL", "openai/gpt-oss-20b")
-# Token de sessao: vem do .env (SPOOK_TOKEN=...). NUNCA hardcode aqui — o repo e publico.
-TOKEN_SESSAO = _ENV.get("SPOOK_TOKEN", "")
+def _token_sessao() -> str:
+    """Token de pareamento dos aparelhos.
+
+    NUNCA deixar o valor no codigo: o repo e publico. Vem do .env
+    (SPOOK_TOKEN) ou, na falta dele, de ~/.pentestlink/token_sessao.txt
+    (o mesmo arquivo que o servidor do Arch usa).
+    """
+    t = _ENV.get("SPOOK_TOKEN", "").strip()
+    if t:
+        return t
+    try:
+        return (Path.home() / ".pentestlink" / "token_sessao.txt").read_text().strip()
+    except Exception:
+        return ""
+
+
+TOKEN_SESSAO = _token_sessao()
 if not TOKEN_SESSAO:
-    raise SystemExit("SPOOK_TOKEN nao configurado: defina SPOOK_TOKEN=<token> no .env")
+    print("[AVISO] SPOOK_TOKEN vazio: nenhum aparelho conseguira autenticar", flush=True)
+
+# Track connected clients
+CONNECTED_CLIENTS = {}  # sid -> {"device": "android|arch|overlay|unknown", "connected_at": time}
+
 
 # Memoria da IA (armazenada na VM)
 MEMORIA_DIR = Path("/home/ubuntu/spook-relay/data/memoria_ia")
 MEMORIA_DIR.mkdir(parents=True, exist_ok=True)
 MAX_HISTORICO = 20
-N_PERGUNTAS_PRA_EXTRACAO = 3   # extrai fatos a cada N perguntas do usuario
-
-
-USUARIO_PADRAO = "taylor"
-
-
-def _safe(nome: str) -> str:
-    s = "".join(c for c in str(nome) if c.isalnum() or c in "-_").strip()
-    return s or "default"
+CONSOLIDA_CADA = 10
 
 
 def _mem_path(sessao_id: str) -> Path:
-    """Historico curto de UMA conversa (por sessao/dispositivo)."""
-    return MEMORIA_DIR / f"sessao-{_safe(sessao_id)}.json"
-
-
-def _usuario_path(usuario: str) -> Path:
-    """Memoria de LONGO PRAZO, compartilhada por todos os dispositivos."""
-    return MEMORIA_DIR / f"usuario-{_safe(usuario or USUARIO_PADRAO)}.json"
+    safe = "".join(c for c in sessao_id if c.isalnum() or c in "-_").strip()
+    if not safe:
+        safe = "default"
+    return MEMORIA_DIR / f"{safe}.json"
 
 
 def _load_mem(sessao_id: str) -> dict:
     path = _mem_path(sessao_id)
     if not path.exists():
-        return {"historico": []}
+        return {"perfil": [], "historico": []}
     try:
         with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        d.setdefault("historico", [])
-        return d
+            return json.load(f)
     except Exception:
-        return {"historico": []}
+        return {"perfil": [], "historico": []}
 
 
 def _save_mem(sessao_id: str, data: dict):
-    _escrever_json(_mem_path(sessao_id), data)
-
-
-def _load_usuario(usuario: str) -> dict:
-    path = _usuario_path(usuario)
-    if not path.exists():
-        return {"perfil": [], "instrucoes": ""}
+    path = _mem_path(sessao_id)
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        d.setdefault("perfil", [])
-        d.setdefault("instrucoes", "")
-        return d
-    except Exception:
-        return {"perfil": [], "instrucoes": ""}
-
-
-def _save_usuario(usuario: str, data: dict):
-    data["atualizado"] = _agora_iso()
-    _escrever_json(_usuario_path(usuario), data)
-
-
-def _escrever_json(path: Path, data: dict):
-    try:
-        tmp = path.with_suffix(".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
             json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
 
 
-def _agora_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _migra_perfis_antigos():
-    """Joga os perfis das sessoes antigas (pre-2026-09-25) na memoria do usuario."""
-    destino = USUARIO_PADRAO
-    u = _load_usuario(destino)
-    mudou = False
-    for p in MEMORIA_DIR.glob("*.json"):
-        if p.name.startswith(("usuario-", "sessao-")):
-            continue
-        try:
-            d = json.load(open(p, "r", encoding="utf-8"))
-        except Exception:
-            continue
-        for f in d.get("perfil", []) or []:
-            fs = str(f).strip()
-            if fs and not any(fs.lower() in x.lower() or x.lower() in fs.lower() for x in u["perfil"]):
-                u["perfil"].append(fs)
-                mudou = True
-    if mudou:
-        _save_usuario(destino, u)
-        print(f"[IA] perfil migrado -> {len(u['perfil'])} fato(s)")
-
-
-# extracao de fatos: fora do caminho da resposta (thread), com cooldown
-_ultima_extracao: dict = {}
-
-
-def _extrair_fatos(usuario: str, sessao_id: str, perguntas: list):
-    """Chama o Groq e funde fatos duraveis no perfil COMPARTILHADO do usuario."""
-    u = _load_usuario(usuario)
-    texto = "\n".join(perguntas)
-    if not texto.strip():
+def _maybe_consolidate(sessao_id: str, mem: dict):
+    hist = mem.get("historico", [])
+    if len(hist) % CONSOLIDA_CADA != 0:
         return
+    if len(hist) < CONSOLIDA_CADA:
+        return
+    recentes = hist[-(CONSOLIDA_CADA * 2):]
+    texto = "\n".join(f"{m['role']}: {m['content']}" for m in recentes)
     try:
+        prompt = (
+            "Extraia 3-5 fatos duraveis sobre o usuario desta conversa recente. "
+            "Fatos = preferencias, nomes, projetos, contexto tecnico, objetivos. "
+            "Retorne apenas uma lista JSON de strings, sem explicacao.\n\n"
+            f"Conversa:\n{texto}"
+        )
         r = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
                 "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": (
-                    "Extraia fatos uteis e DURADAVEIS sobre o usuario das mensagens abaixo.\n"
-                    "Interessa: nome, preferencias, habitos, projetos, ferramentas, objetivos, "
-                    "maquinas que ele usa, problemas recorrentes.\n"
-                    "Ignore novidades temporarias e facts sem importancia. Se nao houver nada duravel, "
-                    "retorne lista vazia.\n"
-                    "Responda APENAS com JSON: lista de strings curtas em portugues.\n\n"
-                    f"Mensagens:\n{texto}"
-                )}],
+                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 500,
-                "temperature": 0.1,
+                "temperature": 0.2,
             },
             timeout=30,
         )
         r.raise_for_status()
-        bruto = r.json()["choices"][0]["message"]["content"].strip()
-        if bruto.startswith("```"):
-            bruto = bruto.strip("`")
-            bruto = bruto.split("\n", 1)[1] if "\n" in bruto else bruto
-        fatos = json.loads(bruto)
-        if not isinstance(fatos, list):
-            return
-        perfil = u.setdefault("perfil", [])
-        antes = len(perfil)
-        for f in fatos:
-            fs = str(f).strip()
-            if fs and not any(fs.lower() in x.lower() or x.lower() in fs.lower() for x in perfil):
-                perfil.append(fs)
-        perfil[:] = perfil[-60:]
-        if len(perfil) != antes:
-            _save_usuario(usuario, u)
-            print(f"[IA] perfil {usuario}: {antes} -> {len(perfil)} fato(s)")
-    except Exception as e:
-        print(f"[IA] extracao falhou: {e}")
-
-
-def _talvez_extrair_async(usuario: str, sessao_id: str, pergunta: str):
-    """Dispara a extracao em background, no maximo a cada N perguntas do usuario."""
-    if not GROQ_API_KEY or not pergunta.strip():
-        return
-    chave = _safe(usuario)
-    n = _ultima_extracao.get(chave, 0) + 1
-    _ultima_extracao[chave] = n
-    if n % N_PERGUNTAS_PRA_EXTRACAO != 0 and n != 1:
-        return
-    mem = _load_mem(sessao_id)
-    perguntas = [m["content"] for m in mem.get("historico", []) if m.get("role") == "user"][-12:]
-    if pergunta.strip():
-        perguntas.append(pergunta)
-    threading.Thread(target=_extrair_fatos, args=(usuario, sessao_id, perguntas), daemon=True).start()
-
-
-def _pergunta_pendente(sessao_id):
-    """Texto (str) da pergunta original. _perguntas_pendentes guarda um dict
-    {pergunta, usuario} — enviar o dict inteiro quebra a continuacao da acao,
-    porque o texto entra no historico da IA e precisa ser str."""
-    pend = _perguntas_pendentes.get(sessao_id, "")
-    if isinstance(pend, dict):
-        return str(pend.get("pergunta", ""))
-    return str(pend or "")
+        facts_text = r.json()["choices"][0]["message"]["content"].strip()
+        try:
+            facts = json.loads(facts_text)
+            if isinstance(facts, list):
+                perfil = mem.setdefault("perfil", [])
+                for f in facts:
+                    fs = str(f).strip()
+                    if fs and not any(fs.lower() in p.lower() or p.lower() in fs.lower() for p in perfil):
+                        perfil.append(fs)
+                if len(perfil) > 30:
+                    perfil[:] = perfil[-30:]
+                _save_mem(sessao_id, mem)
+        except json.JSONDecodeError:
+            pass
+    except Exception:
+        pass
 
 
 def _executar_tool_call(tool_call: dict, sessao_id: str) -> dict:
@@ -219,28 +142,34 @@ def _executar_tool_call(tool_call: dict, sessao_id: str) -> dict:
         alvo = params.get("alvo", "")
         if not scan_nome:
             return {"ok": False, "erro": "scan nao especificado"}
-        try:
-            socketio.emit("ia_executar_scan", {"scan": scan_nome, "alvo": alvo, "sessao_id": sessao_id, "pergunta_original": _pergunta_pendente(sessao_id)})
-            return {"ok": True, "status": "scan_enviado_para_execucao", "scan": scan_nome, "alvo": alvo}
-        except Exception as e:
-            return {"ok": False, "erro": f"falha ao enviar scan: {e}"}
+        if relay_bridge_sio and relay_bridge_sio.connected:
+            try:
+                relay_bridge_sio.emit("ia_executar_scan", {"scan": scan_nome, "alvo": alvo, "sessao_id": sessao_id})
+                return {"ok": True, "status": "scan_enviado_para_execucao", "scan": scan_nome, "alvo": alvo}
+            except Exception as e:
+                return {"ok": False, "erro": f"falha ao enviar scan: {e}"}
+        return {"ok": False, "erro": "bridge_nao_conectado"}
 
     elif acao == "executar_comando_notebook":
         comando_nome = params.get("comando")
         if not comando_nome:
             return {"ok": False, "erro": "comando nao especificado"}
-        try:
-            socketio.emit("ia_executar_comando", {"comando": comando_nome, "sessao_id": sessao_id, "pergunta_original": _pergunta_pendente(sessao_id)})
-            return {"ok": True, "status": "comando_enviado_para_execucao", "comando": comando_nome}
-        except Exception as e:
-            return {"ok": False, "erro": f"falha ao enviar comando: {e}"}
+        if relay_bridge_sio and relay_bridge_sio.connected:
+            try:
+                relay_bridge_sio.emit("ia_executar_comando", {"comando": comando_nome, "sessao_id": sessao_id})
+                return {"ok": True, "status": "comando_enviado_para_execucao", "comando": comando_nome}
+            except Exception as e:
+                return {"ok": False, "erro": f"falha ao enviar comando: {e}"}
+        return {"ok": False, "erro": "bridge_nao_conectado"}
 
     elif acao == "obter_info_sistema":
-        try:
-            socketio.emit("ia_obter_info", {"sessao_id": sessao_id, "pergunta_original": _pergunta_pendente(sessao_id)})
-            return {"ok": True, "status": "info_solicitada"}
-        except Exception as e:
-            return {"ok": False, "erro": f"falha: {e}"}
+        if relay_bridge_sio and relay_bridge_sio.connected:
+            try:
+                relay_bridge_sio.emit("ia_obter_info", {"sessao_id": sessao_id})
+                return {"ok": True, "status": "info_solicitada"}
+            except Exception as e:
+                return {"ok": False, "erro": f"falha: {e}"}
+        return {"ok": False, "erro": "bridge_nao_conectado"}
 
     return {"ok": False, "erro": f"acao desconhecida: {acao}"}
 
@@ -345,19 +274,12 @@ def montar_instrucoes_ia():
     catalogo = "\n".join(linhas_scans + [""] + linhas_notebook)
     return (
         "Voce e SPOOK, assistente geral do app SPOOK. Responda em portugues, de forma clara, objetiva e util. "
-        "IMPORTANTE: responda em TEXTO SIMPLES. Nao use markdown (nada de **negrito**, #, _italico_ ou listas com -). "
-        "Pode usar quebras de linha curtas para separar paragrafos. "
         "Voce pode ajudar com qualquer assunto: tecnologia, pentest, redes, Linux, programacao, e tambem com "
         "perguntas gerais do dia a dia. "
         "Quando o usuario pedir para executar um scan ou comando do proprio app, voce pode:\n"
         "1) Explicar como fazer\n"
         "2) Emitir um evento de acao para o sistema executar (scans no Termux, comandos no notebook)\n"
         "Sempre pergunte confirmacao antes de executar algo destrutivo.\n\n"
-        "QUANDO O USUARIO PEDIR PARA EXECUTAR ACAO DO CATALOGO, responda em JSON:\n"
-        '<system>\n{"tool_call": {"acao": "<acao>", "params": {"<nome_param>": "<valor>"}}}\n</system>\n'
-        "onde acao pode ser: executar_scan (params: scan, alvo), executar_comando_notebook (params: comando), "
-        "obter_info_sistema (sem params). Responda SO o JSON acima, sem texto extra, quando a acao for pedida. "
-        "Fora de pedidos de acao, responda normalmente em texto.\n\n"
         "Catalogo de scans e comandos do app (referencia):\n"
         f"{catalogo}\n\n"
         "Wordlists no Termux (celular):\n"
@@ -378,20 +300,8 @@ def montar_instrucoes_ia():
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", max_http_buffer_size=25 * 1024 * 1024)
 
-# Presenca do CELULAR real: cliente que conecta de IP que NAO e o Arch
-# (overlay/bridge ficam em 100.78.69.110 ou 127.0.0.1) = app no celular.
-_REMOTO_IP_NAO_CEL = {"127.0.0.1", "100.78.69.110"}
-_remoto_sids = set()
-
-
-def _client_remoto():
-    return str(request.environ.get("REMOTE_ADDR", "")) not in _REMOTO_IP_NAO_CEL
-
 # Bridge para o Arch (chat/tasks/notificacoes/ia_acoes)
 relay_bridge_sio = None
-
-# Sessoes com tool_call em andamento: sessao_id -> pergunta_original
-_perguntas_pendentes = {}
 
 
 # IA namespace (/ia)
@@ -405,28 +315,24 @@ def conectar_ia():
         return False
 
 
-def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARIO_PADRAO):
+def _responder_ia_core(pergunta, sessao_id, historico_extra=None):
     """Core logic para responder IA, usado tanto pelo handler principal quanto pelo loop."""
     mem = _load_mem(sessao_id)
-    u = _load_usuario(usuario)
-    perfil = u.get("perfil", [])
+    perfil = mem.get("perfil", [])
     historico = mem.get("historico", [])[-MAX_HISTORICO:]
 
     system_content = montar_instrucoes_ia()
-    instr = str(u.get("instrucoes", "")).strip()
-    if instr:
-        system_content += "\n\n[Instrucoes permanentes do usuario (obedeca sempre)]:\n" + instr
     if perfil:
         system_content += "\n\n[Perfil do usuario - fatos conhecidos:]\n" + "\n".join(f"- {p}" for p in perfil)
     if historico:
-        system_content += "\n\n[Historico recente da conversa]:\n" + "\n".join(
-            f"{'Usuario' if m['role'] == 'user' else 'SPOOK'}: {str(m.get('content', ''))[:200]}"
+        system_content += "\n\n[Historico recente da conversa:]\n" + "\n".join(
+            f"{'Usuario' if m['role'] == 'user' else 'SPOOK'}: {m['content'][:200]}"
             for m in historico
         )
     if historico_extra:
         for m in historico_extra:
             role = "Usuario" if m['role'] == 'user' else 'SPOOK'
-            system_content += f"\n{role}: {str(m.get('content', ''))[:200]}"
+            system_content += f"\n{role}: {m['content'][:200]}"
 
     mensagens = [{"role": "system", "content": system_content}, {"role": "user", "content": pergunta}]
 
@@ -451,50 +357,10 @@ def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARI
     tool_call = None
     try:
         import re as _re
-        idx = conteudo.find('{"tool_call')
-        if idx == -1:
-            idx = conteudo.find("{'tool_call'")
-        if idx != -1:
-            # extrai objeto JSON balanceado por chaves a partir de idx
-            alvo = conteudo[idx:]
-            profundidade = 0
-            inicio = None
-            fim = 0
-            dentro_aspas = False
-            escape = False
-            for i, ch in enumerate(alvo):
-                if dentro_aspas:
-                    if escape:
-                        escape = False
-                    elif ch == "\\":
-                        escape = True
-                    elif ch == '"':
-                        dentro_aspas = False
-                    continue
-                if ch == '"':
-                    dentro_aspas = True
-                elif ch == "{":
-                    if profundidade == 0:
-                        inicio = i
-                    profundidade += 1
-                elif ch == "}":
-                    profundidade -= 1
-                    if profundidade == 0:
-                        fim = i + 1
-                        break
-            if inicio is not None and fim > inicio:
-                bloco = alvo[inicio:fim]
-                dados_tool = json.loads(bloco)
-                tool_call = dados_tool.get("tool_call") or dados_tool
-                conteudo = (conteudo[:idx] + conteudo[idx + fim:]).strip()
-                conteudo = conteudo.replace("<system>", "").replace("</system>", "").strip()
-            else:
-                import re as _re2
-                tc2 = _re2.search(r'\{"tool_call"\s*:\s*\{[^\}]*\}\}', conteudo)
-                if tc2:
-                    tc_dados = json.loads(tc2.group())
-                    tool_call = tc_dados.get("tool_call") or tc_dados
-                    conteudo = _re2.sub(r'\{"tool_call"\s*:\s*\{[^\}]*\}\}', '', conteudo).strip()
+        tc_match = _re.search(r'\{"tool_call"\s*:\s*\{.*?\}\}', conteudo, _re.DOTALL)
+        if tc_match:
+            tool_call = json.loads(tc_match.group())
+            conteudo = _re.sub(r'\{"tool_call"\s*:\s*\{.*?\}\}', '', conteudo, flags=_re.DOTALL).strip()
     except Exception:
         pass
 
@@ -505,7 +371,6 @@ def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARI
 def responder_chat_ia(dados):
     pergunta = str((dados or {}).get("pergunta", "")).strip()
     sessao_id = str((dados or {}).get("sessao_id", "")).strip() or request.sid
-    usuario = str((dados or {}).get("usuario", "")).strip() or USUARIO_PADRAO
     if not GROQ_API_KEY:
         emit("chat_ia_resposta", {"ok": False, "resposta": "IA nao configurada. Adicione GROQ_API_KEY no servidor."})
         return
@@ -517,28 +382,23 @@ def responder_chat_ia(dados):
         return
 
     try:
-        conteudo, tool_call, mem, historico = _responder_ia_core(pergunta, sessao_id, usuario=usuario)
+        conteudo, tool_call, mem, historico = _responder_ia_core(pergunta, sessao_id)
 
-        if tool_call:
-            _perguntas_pendentes[sessao_id] = {"pergunta": pergunta, "usuario": usuario}
-            resultado = _executar_tool_call(tool_call, sessao_id)
-            if not resultado.get("ok"):
-                _perguntas_pendentes.pop(sessao_id, None)
-                emit("chat_ia_resposta", {"ok": False, "resposta": f"Erro ao executar acao: {resultado.get('erro')}", "sessao_id": sessao_id})
-            return
-
+        # Atualiza memoria com pergunta + resposta
         historico.append({"role": "user", "content": pergunta})
         historico.append({"role": "assistant", "content": conteudo})
         if len(historico) > MAX_HISTORICO:
             historico = historico[-MAX_HISTORICO:]
         mem["historico"] = historico
 
+        _maybe_consolidate(sessao_id, mem)
         _save_mem(sessao_id, mem)
-        # memoria de longo prazo: extrai fatos em background (nao trava a resposta)
-        _talvez_extrair_async(usuario, sessao_id, pergunta)
 
-        emit("chat_ia_resposta", {"ok": True, "resposta": conteudo, "sessao_id": sessao_id,
-                                  "usuario": usuario})
+        emit("chat_ia_resposta", {"ok": True, "resposta": conteudo, "sessao_id": sessao_id})
+
+        if tool_call:
+            resultado = _executar_tool_call(tool_call, sessao_id)
+            socketio.emit("ia_resultado_acao", {"sessao_id": sessao_id, "resultado": resultado, "pergunta_original": pergunta}, namespace="/ia")
 
     except requests.RequestException as erro:
         emit("chat_ia_resposta", {"ok": False, "resposta": f"Falha na IA: {erro}"})
@@ -548,12 +408,52 @@ def responder_chat_ia(dados):
 
 @socketio.on("ia_resultado_acao", namespace="/ia")
 def ia_resultado_acao(dados):
-    """Compat: resultado de acao via /ia, delega a continuação server-side."""
-    _continuar_acao(
-        (dados or {}).get("sessao_id"),
-        (dados or {}).get("resultado", {}),
-        (dados or {}).get("pergunta_original", ""),
-    )
+    """Recebe resultado de acao executada e continua a conversa com a IA."""
+    sessao_id = (dados or {}).get("sessao_id")
+    resultado = (dados or {}).get("resultado", {})
+    pergunta_original = (dados or {}).get("pergunta_original", "")
+
+    if not sessao_id or not resultado:
+        return
+
+    try:
+        # Build follow-up messages: pergunta original + resultado
+        historico_extra = [
+            {"role": "assistant", "content": "Acao executada."},
+            {"role": "user", "content": f"Resultado da acao: {json.dumps(resultado, ensure_ascii=False)}"}
+        ]
+        conteudo, tool_call, mem, historico = _responder_ia_core(
+            f"Resultado da acao anterior: {json.dumps(resultado, ensure_ascii=False)}", 
+            sessao_id, 
+            historico_extra
+        )
+
+        # Atualiza memoria
+        historico.append({"role": "assistant", "content": conteudo})
+        if len(historico) > MAX_HISTORICO:
+            historico = historico[-MAX_HISTORICO:]
+        mem["historico"] = historico
+        _maybe_consolidate(sessao_id, mem)
+        _save_mem(sessao_id, mem)
+
+        emit("chat_ia_resposta", {"ok": True, "resposta": conteudo, "sessao_id": sessao_id})
+
+        if tool_call:
+            novo_resultado = _executar_tool_call(tool_call, sessao_id)
+            socketio.emit("ia_resultado_acao", {"sessao_id": sessao_id, "resultado": novo_resultado, "pergunta_original": pergunta_original}, namespace="/ia")
+
+    except Exception as e:
+        emit("chat_ia_resposta", {"ok": False, "resposta": f"Falha ao processar resultado: {e}"})
+
+
+# Bridge para o Arch
+relay_bridge_sio = None
+
+
+# IA namespace (/ia)
+def conectar_ia():
+    if not GROQ_API_KEY:
+        return False
 
 
 # Chat / Task sockets (default namespace)
@@ -563,24 +463,11 @@ def connect(auth=None):
     if token != TOKEN_SESSAO:
         print(f"[RELAY] Conexao negada: token {token}")
         return False
-    print("[RELAY] Cliente conectado (token valido).")
-    remoto = _client_remoto()
-    mudou = remoto and not _remoto_sids
-    if remoto:
-        _remoto_sids.add(request.sid)
-    if mudou:
-        socketio.emit("celular_presenca", {"online": True})
-    else:
-        emit("celular_presenca", {"online": bool(_remoto_sids)})
-
-
-@socketio.on("disconnect")
-def ao_desconectar():
-    print("[RELAY] Cliente desconectou.", flush=True)
-    if request.sid in _remoto_sids:
-        _remoto_sids.discard(request.sid)
-        if not _remoto_sids:
-            socketio.emit("celular_presenca", {"online": False})
+    sid = request.sid
+    # Determine device type from auth or default
+    device = (auth or {}).get("device", "unknown")
+    CONNECTED_CLIENTS[sid] = {"device": device, "connected_at": time.time()}
+    print(f"[RELAY] Cliente conectado: {sid} ({device})")
 
 
 @socketio.on("chat_listar")
@@ -652,7 +539,7 @@ def ia_executar_scan(dados):
     resultado = dados.get("resultado", {})
     pergunta_original = (dados or {}).get("pergunta_original", "")
     if sessao_id and resultado:
-        _continuar_acao(sessao_id, resultado, pergunta_original)
+        socketio.emit("ia_resultado_acao", {"sessao_id": sessao_id, "resultado": resultado, "pergunta_original": pergunta_original}, namespace="/ia")
 
 
 @socketio.on("ia_executar_comando")
@@ -662,7 +549,7 @@ def ia_executar_comando(dados):
     resultado = dados.get("resultado", {})
     pergunta_original = (dados or {}).get("pergunta_original", "")
     if sessao_id and resultado:
-        _continuar_acao(sessao_id, resultado, pergunta_original)
+        socketio.emit("ia_resultado_acao", {"sessao_id": sessao_id, "resultado": resultado, "pergunta_original": pergunta_original}, namespace="/ia")
 
 
 @socketio.on("ia_obter_info")
@@ -672,148 +559,10 @@ def ia_obter_info(dados):
     resultado = dados.get("resultado", {})
     pergunta_original = (dados or {}).get("pergunta_original", "")
     if sessao_id and resultado:
-        _continuar_acao(sessao_id, resultado, pergunta_original)
-
-
-def _continuar_acao(sessao_id, resultado, pergunta_original):
-    """Continua a conversa com o resultado da acao executada (server-side)."""
-    if not sessao_id or not resultado:
-        return
-    if sessao_id not in _perguntas_pendentes:
-        return
-    _pend = _perguntas_pendentes.pop(sessao_id)
-    usuario = _pend.get("usuario", USUARIO_PADRAO) if isinstance(_pend, dict) else USUARIO_PADRAO
-    # a ponte (Arch) pode devolver a pergunta original como dict; o texto vai
-    # para o historico da IA e precisa ser str
-    if isinstance(pergunta_original, dict):
-        pergunta_original = str(pergunta_original.get("pergunta", ""))
-    else:
-        pergunta_original = str(pergunta_original or "")
-
-    try:
-        historico_extra = [
-            {"role": "assistant", "content": "Acao executada."},
-            {"role": "user", "content": f"Resultado da acao: {json.dumps(resultado, ensure_ascii=False)}"},
-            {"role": "assistant", "content": pergunta_original or "Continue."}
-        ]
-        conteudo, tool_call, mem, historico = _responder_ia_core(
-            f"Resultado da acao: {json.dumps(resultado, ensure_ascii=False)}\nAgora responda ao usuario.",
-            sessao_id,
-            historico_extra,
-            usuario=usuario,
-        )
-
-        historico.append({"role": "assistant", "content": conteudo})
-        if len(historico) > MAX_HISTORICO:
-            historico = historico[-MAX_HISTORICO:]
-        mem["historico"] = historico
-        _save_mem(sessao_id, mem)
-        _talvez_extrair_async(usuario, sessao_id, pergunta_original or "")
-
-        socketio.emit("chat_ia_resposta", {"ok": True, "resposta": conteudo,
-                                           "sessao_id": sessao_id, "usuario": usuario}, namespace="/ia")
-
-    except Exception as e:
-        socketio.emit("chat_ia_resposta", {"ok": False, "resposta": f"Falha ao processar resultado: {e}"}, namespace="/ia")
+        socketio.emit("ia_resultado_acao", {"sessao_id": sessao_id, "resultado": resultado, "pergunta_original": pergunta_original}, namespace="/ia")
 
 
 # Media upload / serve
-RELATORIOS_DIR = Path(os.environ.get("SPOOK_RELATORIOS_DIR", "/home/ubuntu/spook-relay/data/relatorios"))
-RELATORIOS_DRIVE = "gdrive:SPOOK/relatorios"
-
-
-ARCH_URL = os.environ.get("SPOOK_ARCH_URL", "http://100.78.69.110:5000").rstrip("/")
-
-
-def _converter_no_arch(destino, nome):
-    """Pede ao Arch para gerar o .docx e subir no Drive.
-
-    So entra como RESERVA: o relay gera o .docx localmente e so
-    chama o notebook se isso falhar. Conectando com o notebook desligado o
-    Tailscale nao responde nada, e com timeout=300 o upload ficava 5 minutos
-    parado antes de cair no .log cru — por isso o connect timeout e curtinho.
-    Devolve a lista de documentos gerados, ou None se deu falha (aí o relay
-    sobe o .log cru como reserva e o app ainda mostra o texto).
-    """
-    try:
-        with open(str(destino), "r", encoding="utf-8", errors="replace") as arq:
-            texto = arq.read()
-        base, _ext = os.path.splitext(nome)
-        r = requests.post(
-            ARCH_URL + "/relatorio/ingressar",
-            json={"nome": base, "texto": texto},
-            headers={"Authorization": "Bearer " + TOKEN_SESSAO},
-            timeout=(4, 120),
-        )
-        if r.status_code == 200:
-            docs = (r.json() or {}).get("documentos") or []
-            if docs:
-                return docs
-        print("[relay] arch recusou a conversao: %s %s" % (r.status_code, r.text[:120]), flush=True)
-    except Exception as e:
-        print("[relay] sem conversao no arch (%s) — subindo o .log cru" % e, flush=True)
-    return None
-
-
-def _documentos_no_arch(destino, nome):
-    """Gera o .docx aqui no relay (OOXML na mao) e sobe pro Drive.
-
-    O notebook pode estar desligado: a conversao tem que funcionar na nuvem.
-    Devolve a lista de arquivos que foram para o Drive, ou None.
-    """
-    try:
-        import relatorio_doc
-    except Exception as e:
-        print("[relay] relatorio_doc ausente (%s) — usando o arch como reserva" % e, flush=True)
-        return None
-    try:
-        with open(str(destino), "r", encoding="utf-8", errors="replace") as arq:
-            texto = arq.read()
-        base = os.path.splitext(nome)[0]
-        docs = relatorio_doc.gerar_documentos(str(RELATORIOS_DIR), base, texto)
-        subidos = []
-        # so o .docx sobe pro Drive: e o que o Taylor EDITA no Drive/Google Docs,
-        # ja com a fonte mono e a cor por trecho da janela REPORTS. O .txt nao
-        # sobe porque nao tem fonte nem cor nenhuma, e o app le o texto do
-        # mirror local (que e persistente).
-        for caminho in (docs.get("docx"),):
-            if not caminho:
-                continue
-            p = hub_store._run(["copyto", str(caminho), RELATORIOS_DRIVE + "/" + Path(caminho).name],
-                               check=False, timeout=180)
-            if p.returncode == 0:
-                subidos.append(Path(caminho).name)
-        if subidos:
-            return subidos
-        print("[relay] docx local nao gerou documento: %s" % (docs.get("erros") or ["?"]), flush=True)
-    except Exception as e:
-        print("[relay] conversao local falhou (%s) — tentando no arch" % e, flush=True)
-    return None
-
-
-def _subir_relatorio(origem, nome, tentativas=4):
-    """Espelha o relatorio no relay, gera o DOCX aqui mesmo e sobe pro Drive.
-    Reserva: se a conversao falhar (nem local nem no arch), sobe o texto cru
-    para o relatorio nao sumir. Devolve o nome do que foi para o Drive."""
-    RELATORIOS_DIR.mkdir(parents=True, exist_ok=True)
-    destino = RELATORIOS_DIR / nome
-    try:
-        if os.path.exists(str(destino)):
-            base, ext = os.path.splitext(nome)
-            destino = RELATORIOS_DIR / ("%s_%d%s" % (base, int(time.time()) % 100000, ext))
-        import shutil
-        shutil.copyfile(origem, str(destino))
-    except Exception as e:
-        return nome
-    docs = _documentos_no_arch(destino, destino.name) or _converter_no_arch(destino, destino.name)
-    if docs:
-        return ", ".join(docs)
-    # Sem DOCX nao sobe texto cru: o Taylor so quer o editavel no Drive (o
-    # que abria "nao". O arquivo cru continua no mirror local).
-    print("[relay] docx nao gerou para %s; texto cru so no mirror local" % destino.name, flush=True)
-    return destino.name
-
-
 @app.route("/upload", methods=["POST"])
 def upload():
     auth = request.headers.get("Authorization", "")
@@ -827,21 +576,12 @@ def upload():
     msg_id = request.form.get("id", "")
     tipo = request.form.get("tipo", "arquivo")
     texto = request.form.get("texto", "")
-    pasta = (request.form.get("pasta", "") or "").strip().lower()
 
     nome = os.path.basename(file.filename).replace(" ", "_")
-    # mesmo diretorio que o hub_store espelha (SPOOK_MEDIA_DIR no unit);
-    # /tmp se perde no reboot e deixava o outbox sem arquivo de origem
-    media_dir = Path(os.environ.get("SPOOK_MEDIA_DIR", "/tmp/spook_media_local"))
+    media_dir = Path("/tmp/spook_media_local")
     media_dir.mkdir(exist_ok=True)
     caminho_final = media_dir / nome
     file.save(str(caminho_final))
-
-    # pasta=relatorios: relatorio de scan vai para gdrive:SPOOK/relatorios,
-    # que e a pasta que o botao REPORTS do app abre. Nao entra no chat.
-    if pasta == "relatorios":
-        nome = _subir_relatorio(str(caminho_final), nome)
-        return {"ok": True, "filename": nome, "pasta": "relatorios"}
 
     msg = hub_store.enviar_midia_server(msg_id, texto, "android", tipo, nome, str(caminho_final))
     socketio.emit("chat_nova", msg)
@@ -863,222 +603,419 @@ def rota_listar_media():
     auth = request.headers.get("Authorization", "")
     if auth.replace("Bearer ", "").strip() != TOKEN_SESSAO:
         return {"ok": False, "erro": "Unauthorized"}, 401
+    # O app (galeria do HUB) mostra tamanho e ordena por ele: sem "bytes" o
+    # org.json estourava "No value for bytes" e a galeria caia em erro.
+    itens = []
+    for nome in hub_store.listar_media():
+        item = {"name": nome, "bytes": 0, "mtime": 0}
+        try:
+            st = (hub_store._MEDIA_DIR / nome).stat()
+            item["bytes"] = int(st.st_size)
+            item["mtime"] = int(st.st_mtime * 1000)
+        except Exception:
+            pass
+        itens.append(item)
+    itens.sort(key=lambda i: i["mtime"], reverse=True)
     return {
-        "items": [{"name": n} for n in hub_store.listar_media()],
+        "items": itens,
         "url_drive": "https://drive.google.com/drive/search?q=%22SPOOK%22",
     }
 
 
-# ====================== RELATORIOS (rota nova: 27/09) ==========================
-# O botao REPORTS do app falhava com o notebook desligado porque falava com
-# /relatorios do Arch. Agora quem responde e o relay, que fica na nuvem: o Drive
-# (gdrive:SPOOK/relatorios) e a fonte da verdade e o mirror local so acelera a
-# leitura do texto.
 
-
-def _token_ok() -> bool:
-    auth = request.headers.get("Authorization", "")
-    return auth.replace("Bearer ", "").strip() == TOKEN_SESSAO
-
-
-def _nome_seguro(nome: str) -> str:
-    return Path(str(nome).rsplit("/", 1)[-1]).name
-
-
-def _listar_drive(pasta):
-    p = hub_store._run(["lsjson", pasta], check=False, timeout=120)
-    if p.returncode != 0:
-        return []
-    try:
-        return [it for it in json.loads(p.stdout.decode("utf-8", "replace")) if not it.get("IsDir")]
-    except Exception as e:
-        print("[relay] lsjson quebrou: %s" % e, flush=True)
-        return []
-
-
-def _apagar_drive(pasta, base):
-    """deletefile (nao purge): some da listagem do Drive sem levar a pasta junto."""
-    ok = 0
-    for ext in ("log", "txt", "md", "pdf", "docx"):
-        alvo = "%s/%s.%s" % (pasta, base, ext)
-        p = hub_store._run(["deletefile", alvo], check=False, timeout=90)
-        if p.returncode == 0:
-            ok += 1
-    return ok
-
-
-def _base_sem_ext(nome):
-    bruto = _nome_seguro(nome)
-    for ext in (".log", ".txt", ".md", ".pdf", ".docx"):
-        if bruto.lower().endswith(ext):
-            return bruto[: -len(ext)]
-    return bruto
-
-
-@app.route("/relatorios")
-def rota_listar_relatorios():
+@app.route("/reading/<path:filename>")
+def rota_baixar_reading(filename):
     auth = request.headers.get("Authorization", "")
     if auth.replace("Bearer ", "").strip() != TOKEN_SESSAO:
         return {"ok": False, "erro": "Unauthorized"}, 401
+    import urllib.request
     try:
-        entradas = _listar_drive(RELATORIOS_DRIVE)
-        # agrupa por base: um relatorio pode ter .log/.txt + .docx
-        grupos = {}
-        for it in entradas:
-            nome = str(it.get("Name") or it.get("Path") or "")
-            if not nome:
-                continue
-            base = _base_sem_ext(nome)
-            g = grupos.setdefault(base, {"nome": base, "bytes": 0, "modificado": "", "iso": "", "documentos": []})
-            ext = nome[len(base):].lstrip(".").lower()
-            if ext in ("pdf", "docx", "md"):
-                g["documentos"].append(ext)
-            # metadados vem da maior variante (o .log cru quando ele subiu junto)
-            tamanho = int(it.get("Size") or 0)
-            if tamanho >= g["bytes"]:
-                g["bytes"] = tamanho
-                g["modificado"] = _data_br(str(it.get("ModTime") or ""))
-                g["iso"] = str(it.get("ModTime") or "")
-        itens = sorted(grupos.values(), key=lambda g: g["modificado"], reverse=True)[:200]
-        return {"ok": True, "items": itens, "total": len(grupos)}
+        # Download from gdrive:SPOOK/reading
+        import subprocess, tempfile, os
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp_path = tmp.name
+        r = subprocess.run(["rclone", "copyto", f"gdrive:SPOOK/reading/{filename}", tmp_path], capture_output=True, timeout=60)
+        if r.returncode != 0:
+            os.unlink(tmp_path)
+            return {"ok": False, "erro": "not_found"}, 404
+        with open(tmp_path, "rb") as f:
+            data = f.read()
+        os.unlink(tmp_path)
+        from flask import send_file
+        import io
+        return send_file(io.BytesIO(data), as_attachment=False, download_name=filename, mimetype="application/pdf")
     except Exception as e:
         return {"ok": False, "erro": str(e)}, 500
 
-
-def _data_br(iso: str) -> str:
-    """'2026-09-27T11:35:23.000Z' -> '2026-09-27 11:35:23' (o app mostra esse formato)."""
-    if not iso:
-        return ""
+# ============================ LEITURA (sincronismo onde parei) ============================
+@socketio.on("leitura_puxar")
+def leitura_puxar(dados):
     try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        return iso[:19].replace("T", " ")
-
-
-@app.route("/relatorios/<path:filename>")
-def rota_baixar_relatorio(filename):
-    if not _token_ok():
-        return {"ok": False, "erro": "Unauthorized"}, 401
-    nome = _nome_seguro(filename)
-    if not nome or ".." in nome:
-        return {"ok": False, "erro": "File not found"}, 404
-    # o app pede pela BASE (sem extensao, como a lista agrupa): tenta o texto
-    # cru primeiro, depois o que veio nomeado com extensao.
-    candidatos = [nome]
-    if _base_sem_ext(nome) == nome:
-        candidatos = [nome + ".txt", nome + ".log", nome]
-    # 1) mirror local (rapido), 2) texto cru que veio no upload, 3) Drive
-    for cand in candidatos:
-        for dir_atual in (RELATORIOS_DIR, Path(os.environ.get("SPOOK_MEDIA_DIR", "/tmp/spook_media_local"))):
-            caminho = dir_atual / cand
-            try:
-                if caminho.exists() and caminho.stat().st_size > 0:
-                    return send_file(str(caminho))
-            except Exception:
-                pass
-        p = hub_store._run(["cat", RELATORIOS_DRIVE + "/" + cand], check=False, timeout=120)
-        if p.returncode == 0 and p.stdout:
-            return p.stdout, 200, {"Content-Type": "text/plain; charset=utf-8"}
-    return {"ok": False, "erro": "File not found"}, 404
-
-
-@app.route("/relatorios", methods=["DELETE"])
-def rota_apagar_relatorios():
-    """Apaga varios relatorios (multi-selecao da janela REPORTS) no Drive e no mirror."""
-    if not _token_ok():
-        return {"ok": False, "erro": "Unauthorized"}, 401
-    try:
-        dados = request.get_json(silent=True) or {}
-        nomes = dados.get("nomes") or []
-        if isinstance(nomes, str):
-            nomes = [nomes]
-        apagados = []
-        for nome in list(nomes)[:200]:
-            base = _base_sem_ext(nome)
-            if not base:
-                continue
-            apagados.append(base)
-            try:
-                (RELATORIOS_DIR / (base + ".log")).unlink(missing_ok=True)
-                (RELATORIOS_DIR / (base + ".txt")).unlink(missing_ok=True)
-            except Exception:
-                pass
-            _apagar_drive(RELATORIOS_DRIVE, base)
-        return {"ok": True, "apagados": apagados, "total": len(apagados)}
+        d = dados or {}
+        # Token already validated on connect, no need to re-check
+        # but keep for backward compatibility with HTTP fallback
+        token = d.get("token") or request.args.get("token")
+        if token and token != TOKEN_SESSAO:
+            emit("leitura_resposta", {"ok": False, "erro": "token_invalido"})
+            return
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("leitura_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        safe = "".join(c for c in bookId if c.isalnum() or c in "-_")
+        res = hub_store.obter_leitura(safe)
+        if not res:
+            emit("leitura_resposta", {"ok": True, "bookId": safe, "vazio": True})
+            return
+        emit("leitura_resposta", {"ok": True, **res})
     except Exception as e:
-        return {"ok": False, "erro": str(e)}, 500
-
-# ============================ IA: memoria compartilhada ============================
-def _ia_token_ok() -> bool:
-    auth = request.headers.get("Authorization", "")
-    return auth.replace("Bearer ", "").strip() == TOKEN_SESSAO
+        try:
+            emit("leitura_resposta", {"ok": False, "erro": str(e)})
+        except Exception:
+            pass
 
 
-@app.route("/ia/memoria")
-def ia_memoria_http():
-    """Ver/editar a memoria de longo prazo (a mesma nos dois dispositivos)."""
-    if not _ia_token_ok():
-        return {"ok": False, "erro": "Unauthorized"}, 401
-    usuario = (request.args.get("usuario") or "").strip() or USUARIO_PADRAO
-    if request.method == "DELETE":
-        u = {"perfil": [], "instrucoes": ""}
-        _save_usuario(usuario, u)
-        return {"ok": True, "perfil": [], "instrucoes": ""}
-    if request.method == "POST":
-        corpo = request.get_json(force=True, silent=True) or {}
-        u = _load_usuario(usuario)
-        if "instrucoes" in corpo:
-            u["instrucoes"] = str(corpo.get("instrucoes") or "")[:4000]
-        if isinstance(corpo.get("perfil"), list):
-            u["perfil"] = [str(x).strip() for x in corpo["perfil"] if str(x).strip()][-60:]
-        if isinstance(corpo.get("adicionar"), list):
-            for x in corpo["adicionar"]:
-                fs = str(x).strip()
-                if fs and not any(fs.lower() in p.lower() or p.lower() in fs.lower() for p in u["perfil"]):
-                    u["perfil"].append(fs)
-            u["perfil"] = u["perfil"][-60:]
-        _save_usuario(usuario, u)
-        return {"ok": True, "usuario": usuario, "perfil": u["perfil"], "instrucoes": u["instrucoes"]}
-    u = _load_usuario(usuario)
-    return {"ok": True, "usuario": usuario, "perfil": u.get("perfil", []),
-            "instrucoes": u.get("instrucoes", ""), "atualizado": u.get("atualizado")}
 
-
-@socketio.on("ia_memoria", namespace="/ia")
-def ia_memoria_socket(dados):
-    """O app/overlay pede a memoria; se mandar 'instrucoes', edita."""
-    d = dados or {}
-    usuario = str(d.get("usuario", "")).strip() or USUARIO_PADRAO
-    u = _load_usuario(usuario)
-    if d.get("instrucoes") is not None:
-        u["instrucoes"] = str(d.get("instrucoes") or "")[:4000]
-        _save_usuario(usuario, u)
-    if d.get("limpar"):
-        u["perfil"] = []
-        _save_usuario(usuario, u)
-    emit("ia_memoria", {"ok": True, "usuario": usuario, "perfil": u.get("perfil", []),
-                        "instrucoes": u.get("instrucoes", ""), "atualizado": u.get("atualizado")})
-
-
-def _hook_chat_externo(msg):
-    """Msg que chegou pelo sync do Drive (escrita no Arch/Android): reemite
-    para os clientes do relay, senao o app so ve no proximo chat_listar."""
+@socketio.on("leitura_atualizar")
+def leitura_atualizar(dados):
     try:
-        socketio.emit("chat_nova", msg)
+        d = dados or {}
+        # Token already validated on connect
+        token = d.get("token") or request.args.get("token")
+        if token and token != TOKEN_SESSAO:
+            emit("leitura_resposta", {"ok": False, "erro": "token_invalido"})
+            return
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("leitura_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        safe = "".join(c for c in bookId if c.isalnum() or c in "-_")
+        res = hub_store.atualizar_leitura(safe, d)
+        if res:
+            payload = {"ok": True, **res}
+            emit("leitura_resposta", payload)
+            try:
+                socketio.emit("leitura_estado", payload)
+            except Exception:
+                pass
+        else:
+            emit("leitura_resposta", {"ok": False, "erro": "falha"})
+    except Exception as e:
+        try:
+            emit("leitura_resposta", {"ok": False, "erro": str(e)})
+        except Exception:
+            pass
+
+
+
+
+
+@socketio.on("leitura_listar_drive")
+def leitura_listar_drive(dados):
+    try:
+        livros = hub_store.listar_livros_drive()
+        emit("leitura_listar_drive_resposta", {"ok": True, "livros": livros})
+    except Exception as e:
+        emit("leitura_listar_drive_resposta", {"ok": False, "erro": str(e)})
+
+# ============================ LIVROS v2 (ficha por livro + prateleira) ============================
+# Protocolo novo, com timestamps do cliente para funcionar offline:
+#   prateleira_listar -> prateleira_lista {livros:[ficha]}
+#   livro_puxar  {bookId}                -> livro_resposta {livro}
+#   livro_atualizar {bookId, page, offsetY, percent, em, origem, done?, removido?}
+#                                        -> livro_resposta + broadcast livro_estado
+#   livro_apagar {bookId}                -> tombstone (arquivo fica no Drive)
+#   livro_publicar {bookId, titulo, ext, tamanho, arquivo:{noDrive,nome}} -> anuncia
+
+def _skip_self(evento, payload):
+    try:
+        socketio.emit(evento, payload, skip_sid=request.sid)
     except Exception:
         pass
 
 
-try:
-    hub_store.set_chat_hook(_hook_chat_externo)
-except Exception:
-    pass
+@socketio.on("prateleira_listar")
+def prateleira_listar(dados):
+    try:
+        emit("prateleira_lista", {"ok": True, "livros": hub_store.listar_livros()})
+    except Exception as e:
+        emit("prateleira_lista", {"ok": False, "erro": str(e)})
 
+
+@socketio.on("livro_puxar")
+def livro_puxar(dados):
+    try:
+        d = dados or {}
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("livro_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        rec = hub_store.obter_livro(bookId)
+        if not rec:
+            emit("livro_resposta", {"ok": True, "vazio": True, "bookId": bookId, "livro": None})
+            return
+        emit("livro_resposta", {"ok": True, "vazio": False, "livro": rec})
+    except Exception as e:
+        emit("livro_resposta", {"ok": False, "erro": str(e)})
+
+
+@socketio.on("livro_atualizar")
+def livro_atualizar(dados):
+    try:
+        d = dados or {}
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("livro_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        rec = hub_store.atualizar_livro(bookId, d)
+        if not rec:
+            emit("livro_resposta", {"ok": False, "erro": "bookId_invalido"})
+            return
+        emit("livro_resposta", {"ok": True, "livro": rec})
+        _skip_self("livro_estado", {"ok": True, "livro": rec})
+    except Exception as e:
+        emit("livro_resposta", {"ok": False, "erro": str(e)})
+
+
+@socketio.on("livro_apagar")
+def livro_apagar(dados):
+    try:
+        d = dados or {}
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("livro_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        rec = hub_store.apagar_livro(bookId, device=str(d.get("deviceId") or ""),
+                                     apagar_arquivo=bool(d.get("apagarArquivo")))
+        if not rec:
+            emit("livro_resposta", {"ok": False, "erro": "nao_encontrado"})
+            return
+        emit("livro_resposta", {"ok": True, "livro": rec})
+        _skip_self("livro_estado", {"ok": True, "livro": rec})
+    except Exception as e:
+        emit("livro_resposta", {"ok": False, "erro": str(e)})
+
+
+@socketio.on("livro_publicar")
+def livro_publicar(dados):
+    try:
+        d = dados or {}
+        bookId = str(d.get("bookId") or "").strip()
+        if not bookId:
+            emit("livro_resposta", {"ok": False, "erro": "bookId_obrigatorio"})
+            return
+        patch = {k: d.get(k) for k in ("titulo", "ext", "tamanho", "deviceId") if d.get(k) is not None}
+        patch["arquivo"] = d.get("arquivo") or {}
+        patch["removido"] = False
+        patch["removidoEm"] = int(time.time() * 1000)
+        rec = hub_store.atualizar_livro(bookId, patch)
+        if not rec:
+            emit("livro_resposta", {"ok": False, "erro": "banco"})
+            return
+        emit("livro_resposta", {"ok": True, "livro": rec})
+        _skip_self("livro_estado", {"ok": True, "livro": rec})
+    except Exception as e:
+        emit("livro_resposta", {"ok": False, "erro": str(e)})
+
+
+@socketio.on("livros_puxar")
+def livros_puxar(dados):
+    try:
+        d = dados or {}
+        deviceId = str(d.get("deviceId") or "").strip()
+        if not deviceId:
+            emit("livros_resposta", {"ok": False, "erro": "deviceId_obrigatorio"})
+            return
+        # Return books from ALL other devices (merged, deduplicated by bookId)
+        livros = hub_store.obter_todos_livros(excluir_deviceId=deviceId)
+        emit("livros_resposta", {"ok": True, "deviceId": deviceId, "livros": livros})
+    except Exception as e:
+        emit("livros_resposta", {"ok": False, "erro": str(e)})
+
+@socketio.on("livros_atualizar")
+def livros_atualizar(dados):
+    try:
+        d = dados or {}
+        deviceId = str(d.get("deviceId") or "").strip()
+        livros = d.get("livros", [])
+        if not deviceId:
+            emit("livros_resposta", {"ok": False, "erro": "deviceId_obrigatorio"})
+            return
+        if hub_store.salvar_livros(deviceId, livros):
+            payload = {"ok": True, "deviceId": deviceId, "livros": livros}
+            emit("livros_resposta", payload)
+            # Broadcast to other devices
+            try:
+                socketio.emit("livros_estado", payload)
+            except Exception:
+                pass
+        else:
+            emit("livros_resposta", {"ok": False, "erro": "falha"})
+    except Exception as e:
+        emit("livros_resposta", {"ok": False, "erro": str(e)})
+
+# ============================ LIVROS (arquivo content-addressed) ============================
+_MIME_LIVROS = {"pdf": "application/pdf", "epub": "application/epub+zip"}
+
+
+def _auth_ok():
+    auth = request.headers.get("Authorization", "")
+    return auth.replace("Bearer ", "").strip() == TOKEN_SESSAO
+
+
+@app.route("/livros", methods=["GET"])
+def rota_listar_livros():
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    return {"ok": True, "livros": hub_store.listar_livros()}
+
+
+@app.route("/livros", methods=["POST"])
+def rota_publicar_livro():
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    if "file" not in request.files:
+        return {"ok": False, "erro": "No file"}, 400
+    f = request.files["file"]
+    nome = os.path.basename(f.filename or "livro.pdf")
+    ext = nome.rsplit(".", 1)[-1].lower() if "." in nome else ""
+    if ext not in ("pdf", "epub"):
+        return {"ok": False, "erro": "formato_invalido"}, 400
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix="." + ext)
+    tmp_path = tmp.name
+    tmp.close()
+    try:
+        f.save(tmp_path)
+        rec = hub_store.publicar_livro(
+            tmp_path,
+            book_id=request.form.get("bookId"),
+            titulo=request.form.get("titulo") or nome.rsplit(".", 1)[0],
+            ext=ext,
+            device=request.form.get("deviceId") or request.form.get("device") or "desconhecido",
+        )
+        if not rec:
+            return {"ok": False, "erro": "falha_publicar"}, 500
+        try:
+            socketio.emit("livro_estado", {"ok": True, "livro": rec})
+            socketio.emit("prateleira_lista", {"ok": True, "livros": hub_store.listar_livros()})
+        except Exception:
+            pass
+        return {"ok": True, "bookId": rec["bookId"], "livro": rec}
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+@app.route("/livros/<bookId>", methods=["GET"])
+def rota_obter_livro(bookId):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    rec = hub_store.obter_livro(bookId)
+    if not rec:
+        return {"ok": True, "vazio": True, "bookId": bookId, "livro": None}
+    return {"ok": True, "vazio": False, "livro": rec}
+
+
+@app.route("/livros/<bookId>", methods=["POST"])
+def rota_atualizar_livro(bookId):
+    """Atualiza posicao/done pelo HTTP (o app usa isso quando o socket esta
+    morto - MIUI derruba a conexao em background). Mesma semantica LWW do
+    evento livro_atualizar."""
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    d = request.get_json(silent=True) or {}
+    d.pop("bookId", None)
+    rec = hub_store.atualizar_livro(bookId, d)
+    if not rec:
+        return {"ok": False, "erro": "bookId_invalido"}, 400
+    try:
+        socketio.emit("livro_estado", {"ok": True, "livro": rec})
+    except Exception:
+        pass
+    return {"ok": True, "livro": rec}
+
+
+@app.route("/livros/<bookId>/arquivo")
+def rota_arquivo_livro(bookId):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    rec = hub_store.obter_livro(bookId)
+    if not rec:
+        return {"ok": False, "erro": "nao_encontrado"}, 404
+    caminho = hub_store.baixar_arquivo_livro(rec["bookId"])
+    if not caminho:
+        return {"ok": False, "erro": "arquivo_indisponivel"}, 404
+    mime = _MIME_LIVROS.get((rec.get("ext") or "").lower(), "application/octet-stream")
+    return send_file(str(caminho), mimetype=mime, as_attachment=False,
+                     download_name=(rec.get("arquivo") or {}).get("nome") or caminho.name,
+                     conditional=True)
+
+
+@app.route("/livros/<bookId>", methods=["DELETE"])
+def rota_apagar_livro(bookId):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    rec = hub_store.apagar_livro(bookId, device=request.args.get("device") or "http",
+                                 apagar_arquivo=request.args.get("arquivo") == "1")
+    if not rec:
+        return {"ok": False, "erro": "nao_encontrado"}, 404
+    try:
+        socketio.emit("livro_estado", {"ok": True, "livro": rec})
+    except Exception:
+        pass
+    return {"ok": True, "livro": rec}
+
+
+# ============================ RELATORIOS HTTP ============================
+@app.route("/relatorios")
+def rota_listar_relatorios():
+    rels = hub_store.listar_relatorios()
+    return {"relatorios": rels}
+
+@app.route("/relatorios/<path:filename>")
+def rota_baixar_relatorio(filename):
+    # filename vem sem extensão (base)
+    data = hub_store.baixar_relatorio(filename)
+    if data is None:
+        return {"ok": False, "erro": "nao_encontrado"}, 404
+    # detecta content-type pelo conteudo (o mirror tem o .txt; o Drive o .docx)
+    ctype = "text/plain; charset=utf-8"
+    if data[:2] == b"PK":
+        ctype = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    return data, 200, {"Content-Type": ctype, "Content-Disposition": f'inline; filename="{filename}.txt"'}
+
+@app.route("/relatorios", methods=["DELETE"])
+def rota_apagar_relatorios():
+    import json as _json
+    try:
+        data = request.get_json()
+        if not data or "nomes" not in data:
+            return {"ok": False, "erro": "nomes_obrigatorio"}, 400
+        ok = hub_store.apagar_relatorios(data["nomes"])
+        return {"ok": ok}
+    except Exception as e:
+        return {"ok": False, "erro": str(e)}, 500
 
 @app.route("/healthz")
 def health():
-    return "OK", 200
+    return "OK"
+
+@app.route("/api/connected")
+def api_connected():
+    import time
+    now = time.time()
+    result = {}
+    for sid, info in CONNECTED_CLIENTS.items():
+        result[sid] = {
+            "device": info.get("device", "unknown"),
+            "connected_at": info.get("connected_at", now),
+            "duration_sec": int(now - info.get("connected_at", now))
+        }
+    return {"clients": result, "count": len(result)}
+
 
 if __name__ == "__main__":
-    _migra_perfis_antigos()
     socketio.run(app, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)

@@ -28,7 +28,7 @@ _TASKS_CACHE = _DADOS / Path(os.environ.get("SPOOK_TASKS_CACHE", "spook_tasks_ca
 _CHAT_LOCK = threading.Lock()
 _TASKS_LOCK = threading.Lock()
 _REFRESHER_STARTED = False
-_REFRESHER_INTERVAL = 3
+_REFRESHER_INTERVAL = 5
 _CHAT_VERSION = [0]
 _ULTIMO_SYNC = [0.0]
 _SYNC_LOCK_PATH = "/tmp/spook_sync.lock"
@@ -81,24 +81,10 @@ def _pend_lock():
 _UPLOAD_LOCK_PATH = "/tmp/spook_flush.lock"
 
 
-def _upload_lock(espera=0.0):
-    """flock com timeout. A versao antiga (LOCK_EX sem timeout) deixava
-    um rclone pendurado travar TODOS os outros processos: o item ficava
-    no outbox indefinidamente. Sem o lock, o item so espera o proximo ciclo."""
+def _upload_lock():
     fd = open(_UPLOAD_LOCK_PATH, "a+")
-    if espera <= 0:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return fd
-    ate = time.time() + espera
-    while True:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return fd
-        except OSError:
-            if time.time() >= ate:
-                fd.close()
-                raise TimeoutError("upload lock ocupado")
-            time.sleep(0.5)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    return fd
 
 
 def _carregar_pending():
@@ -134,23 +120,6 @@ def _pin(msg, _tipo_arquivo=None, _src=None):
         fd.close()
 
 
-_MAX_TENTATIVAS = 6
-
-
-def _marcar_tentativa(mid, tent):
-    """Persiste o contador de tentativas no outbox compartilhado."""
-    fd = _pend_lock()
-    try:
-        _PENDING.update(_carregar_pending())
-        it = _PENDING.get(mid)
-        if it is not None:
-            it["_tentativas"] = tent
-            _salvar_pending()
-    finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
-        fd.close()
-
-
 def _flush_pending():
     """Tenta subir TODOS os pendentes do arquivo compartilhado (de qualquer
     processo). Após cada sync, quem pegar o flock re-aplica os que sobraram.
@@ -163,17 +132,8 @@ def _flush_pending():
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
-    _tombs_carregar()
-    descartados = [m for m in _PENDING if m in _TOMBS]
-    if descartados:
-        for m in descartados:
-            _PENDING.pop(m, None)
-        _salvar_pending()
     for mid in [m for m in _PENDING.copy()]:
-        try:
-            fdu = _upload_lock()
-        except (TimeoutError, OSError):
-            continue  # outro processo esta subindo algo; proximo ciclo
+        fdu = _upload_lock()
         try:
             _PENDING.update(_carregar_pending())
             item = _PENDING.get(mid)
@@ -181,27 +141,11 @@ def _flush_pending():
                 continue
             msg = {k: v for k, v in item.items() if not k.startswith("_")}
             if item.get("_tipo_arquivo") and item.get("_src") and not _remoto_tem(item["arquivo"]):
-                # 900s travava o refresher inteiro quando a saida do relay
-                # para o Drive ficava pendurada (TCP do nada). 120s + log:
-                # o item fica no outbox e tenta de novo no proximo ciclo.
-                _log("subindo midia: " + str(item["arquivo"]))
-                _run(["copyto", item["_src"], _base(item["arquivo"])], timeout=120)
+                _run(["copyto", item["_src"], _base(item["arquivo"])], timeout=900)
             if not _remoto_tem(f"{CHAT}/{mid}.json"):
                 _escrever_json(f"{CHAT}/{mid}.json", msg)
-            # A listagem do Drive e eventual:normalmente volta em segundos. Se a
-            # rede nao confirmar, o item ficava PENDENTE PARA SEMPRE e o outbox
-            # so crescia (foi o que travou mensagens/relatorios por 3 dias).
-            # Depois de MAX_TENTATIVAS damos baixa de qualquer forma: o arquivo
-            # ja foi enviado, so a listagem que nao voltou.
             if not _remoto_tem(f"{CHAT}/{mid}.json"):
-                item = _PENDING.get(mid) or {}
-                tent = int(item.get("_tentativas", 0)) + 1
-                item["_tentativas"] = tent
-                _marcar_tentativa(mid, tent)
-                if tent < _MAX_TENTATIVAS:
-                    continue
-                _log("dando baixa apos %d tentativas sem confirmacao da listagem: %s"
-                     % (tent, mid))
+                continue  # listagem ainda nao refletiu; mantem pendente (pin/merge)
             fd = _pend_lock()
             try:
                 _PENDING.update(_carregar_pending())
@@ -210,10 +154,7 @@ def _flush_pending():
             finally:
                 fcntl.flock(fd, fcntl.LOCK_UN)
                 fd.close()
-        except Exception as e:
-            # antes era `continue` mudo: um rclone falhando deixava o item
-            # preso no outbox sem NENHUM rastro no log.
-            _log("item %s falhou: %s: %s" % (mid, type(e).__name__, str(e)[:200]))
+        except Exception:
             continue
         finally:
             fcntl.flock(fdu, fcntl.LOCK_UN)
@@ -248,265 +189,9 @@ def _aaplica_pendentes_locais():
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
-    _tombs_carregar()
     for item in _PENDING.values():
         msg = {k: v for k, v in item.items() if not k.startswith("_")}
-        if msg.get("id") in _TOMBS:
-            continue
         _gravar_local(msg)
-
-
-_ANUNCIADOS = set()
-_CHAT_HOOKS = []
-
-
-def set_chat_hook(fn):
-    """Registra um callback para receber msgs que chegaram de OUTRA maquina."""
-    _CHAT_HOOKS.append(fn)
-    return fn
-
-
-def _marcar_existentes():
-    """Silencia o historico: no boot nao anunciamos tudo de uma vez."""
-    for m in _ler_chat_local():
-        mid = m.get("id")
-        if mid:
-            _ANUNCIADOS.add(mid)
-
-
-def _anunciar_novas():
-    novas = [m for m in _ler_chat_local() if m.get("id") and m["id"] not in _ANUNCIADOS]
-    if not novas:
-        return 0
-    for m in novas:
-        _ANUNCIADOS.add(m["id"])
-    if len(_ANUNCIADOS) > 5000:
-        _marcar_existentes()
-    for fn in list(_CHAT_HOOKS):
-        for m in novas:
-            try:
-                fn(m)
-            except Exception:
-                pass
-    return len(novas)
-
-
-# --- LAPIDES DE CHAT (2026-09-27) -------------------------------------------
-# `rclone sync` e BIDIRECIONAL: se a maquina A apaga uma mensagem e a maquina B
-# ainda tem o arquivo no espelho local, o proximo sync da B RE-SOBE o arquivo e
-# a mensagem volta (bug "apaguei e reapareceu" / "num aparelho sim, no outro
-# nao"). A lapide e um registro unico no Drive (fonte da verdade) que todas as
-# maquinas respeitam: antes de sincronizar, cada uma remove do espelho local
-# todo id lapidado -> nunca mais sobe. Nunca usar `purge` aqui.
-_TOMBS_REMOTE = "_apagados_chat.json"
-_TOMB_CACHE = Path("/tmp/spook_chat_apagados.json")
-_TOMB_MAX_IDS = 4000
-_TOMBS = {}          # {id: epoch do registro}
-_TOMBS_VISTO = {}     # {id: ciclo de sync em que a lapide foi vista}
-_CICLO = [0]          # contador de ciclos de sync (evita depender do relogio)
-_TOMB_PUB_OK = [None]   # ultima versao publicada no Drive
-
-
-def _tombs_carregar():
-    global _TOMBS
-    try:
-        d = json.loads(_TOMB_CACHE.read_text())
-        if isinstance(d, dict):
-            _TOMBS = {str(k): float(v) for k, v in d.items()}
-    except Exception:
-        pass
-    return _TOMBS
-
-
-def _tombs_salvar():
-    global _TOMBS
-    if len(_TOMBS) > _TOMB_MAX_IDS:
-        _TOMBS = dict(sorted(_TOMBS.items(), key=lambda kv: kv[1])[-_TOMB_MAX_IDS:])
-    try:
-        _TOMB_CACHE.write_text(json.dumps(_TOMBS))
-    except Exception:
-        pass
-
-
-def marcar_apagado(msg_id):
-    """Lapida a mensagem: cache local (sincrono) + Drive (background)."""
-    try:
-        _tombs_carregar()
-        _TOMBS[str(msg_id)] = time.time()
-        _tombs_salvar()
-    except Exception:
-        return
-    try:
-        _bg(_tombs_publicar)
-    except Exception:
-        pass
-
-
-def _parse_tombs(txt):
-    """Le o registro de lapides aceitando VARIOS objetos JSON concatenados.
-
-    Duas maquinas gravando ao mesmo tempo podem deixar o objeto no Drive como
-    "{...}{...}" (o json.loads normal quebra com 'Extra data' e a gente perderia
-    a leitura inteira). Aqui parseamos objeto por objeto e unimos tudo."""
-    out = {}
-    dec = json.JSONDecoder()
-    s = (txt or "").strip()
-    i = 0
-    while i < len(s):
-        while i < len(s) and s[i] in " \r\n\t,":
-            i += 1
-        if i >= len(s):
-            break
-        try:
-            obj, j = dec.raw_decode(s, i)
-        except Exception:
-            break
-        i = j
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                try:
-                    out[str(k)] = float(v)
-                except Exception:
-                    pass
-    return out
-
-
-def _tombs_puxar():
-    """Une as lapides do Drive no cache local. True se algo mudou (ou se o
-    local tem algo que o Drive nao tem -> precisa republicar)."""
-    _tombs_carregar()
-    remoto = {}
-    sujo = False
-    try:
-        p = _run(["cat", _base(_TOMBS_REMOTE)], check=False, timeout=60)
-        if p.returncode == 0:
-            txt = p.stdout.decode("utf-8", "replace")
-            remoto = _parse_tombs(txt)
-            # objeto truncado/concatenado no Drive = precisa regravar
-            t = txt.strip()
-            if t and not t.endswith("}"):
-                sujo = True
-    except Exception:
-        return False
-    mudou = sujo
-    for k, v in remoto.items():
-        if v > _TOMBS.get(k, 0):
-            _TOMBS[k] = v
-            mudou = True
-    for k in _TOMBS:
-        if k not in remoto:
-            mudou = True
-    if mudou:
-        _tombs_salvar()
-    return mudou
-
-
-def _tombs_publicar():
-    """Le do Drive, une e regrava (last-writer-wins sem perder lapide de ninguem)."""
-    _tombs_puxar()
-    if _TOMBS != _TOMB_PUB_OK[0]:
-        _tombs_publica_bruto()
-
-
-def _tombs_purgar_locais():
-    """Tira do espelho local todo id lapidado ANTES do sync, e garante que o id
-    lapidado NAO existe mais no Drive (a lapide SEMPRE vence quem tentou
-    re-sober). O sync so faz download: sem o arquivo no Drive ele nunca volta
-    pro espelho."""
-    if not _TOMBS:
-        return 0
-    n = 0
-    for mid in list(_TOMBS):
-        try:
-            f = _CHAT_DIR / f"{mid}.json"
-            if f.exists():
-                f.unlink()
-                n += 1
-        except Exception:
-            pass
-    try:
-        p = _run(["lsjson", _base(CHAT), "--files-only"], check=False, timeout=120)
-        if p.returncode != 0:
-            return n
-        vivos = json.loads(p.stdout.decode("utf-8", "replace") or "[]")
-    except Exception:
-        return n
-    for it in vivos:
-        nome = it.get("Name") or ""
-        if not nome.endswith(".json"):
-            continue
-        mid = nome[:-5]
-        if mid in _TOMBS:
-            try:
-                _run(["deletefile", f"{_base(CHAT)}/{mid}.json"], check=False, timeout=120)
-                n += 1
-            except Exception:
-                pass
-    return n
-
-
-def _tombs_confere_locais():
-    """RODADA DEPOIS do sync. So descarta lapide se o arquivo no espelho for de
-    mensagem CRIADA DEPOIS da lapide (id re-usado de verdade). Mensagem antiga
-    que "voltou" e ressureicao: a lapide continua e o proximo _tombs_purgar_locais
-    a tira de novo do Drive. Compara ts de criacao com ts da lapide na MESMA
-    maquina: nao depende de relogio do outro lado nem da consistencia do Drive."""
-    if not _TOMBS or not _CHAT_DIR.exists():
-        return 0
-    n = 0
-    for k in list(_TOMBS):
-        try:
-            f = _CHAT_DIR / f"{k}.json"
-            if not f.exists():
-                continue
-            msg = json.loads(f.read_text())
-            ts_ms = msg.get("ts")
-            if not isinstance(ts_ms, (int, float)):
-                continue
-            tomb = _TOMBS.get(k, 0)
-            if ts_ms / 1000.0 > tomb + 5:
-                _TOMBS.pop(k, None)
-                _TOMBS_VISTO.pop(k, None)
-                n += 1
-        except Exception:
-            continue
-    if n:
-        _tombs_salvar()
-    return n
-
-
-def _tombs_publica_bruto():
-    try:
-        _run(["copyto", str(_TOMB_CACHE), _base(_TOMBS_REMOTE)], check=False, timeout=120)
-        _TOMB_PUB_OK[0] = dict(_TOMBS)
-    except Exception:
-        return
-    _tombs_dedupe()
-
-
-def _tombs_dedupe():
-    """O Drive ACEITA nomes duplicados. Se as duas maquinas gravam o registro no
-    mesmo instante, o `copyto` nao sobrescreve (nao sabe qual dos objetos
-   casar) e cria mais um -> o `cat` concatena e o registro vira lixo (json
-    quebrado, lapide perdida). Aqui conferimos depois de gravar e, se houver
-    copias, limpamos mantendo a mais nova. So roda quando/publicamos (raro)."""
-    try:
-        p = _run(["lsjson", REMOTE, "--files-only", "--include", "/" + _TOMBS_REMOTE], check=False, timeout=120)
-        if p.returncode != 0:
-            return
-        if len(json.loads(p.stdout.decode() or "[]")) <= 1:
-            return
-        _run(["dedupe", REMOTE, "--include", "/" + _TOMBS_REMOTE, "--dedupe-mode", "newest"], check=False, timeout=300)
-    except Exception:
-        pass
-
-
-def _sync_tombs():
-    """Antes do sync: lapides que o outro lado nao sabe ainda. Depois do sync,
-    o chamador roda _tombs_confere_locais() para lapide que nao grudou."""
-    _tombs_puxar()
-    _CICLO[0] += 1
-    return _tombs_purgar_locais()
 
 
 def _sync_chat():
@@ -515,16 +200,12 @@ def _sync_chat():
         if fd is None:
             return False  # outro processo ja esta sincronizando
         try:
-            _sync_tombs()   # lapides primeiro: impede ressurreicao
             _flush_pending()
             _run(["sync", "--fast-list", "--update", _base(CHAT), str(_CHAT_DIR)], check=False, timeout=300)
-            if _tombs_confere_locais():
-                _tombs_publica_bruto()   # lapide nao gruda no Drive: corrige o registro
             # o sync poda local-exclusivos; pinamos os nossos de volta p/ nao sumir
             _aaplica_pendentes_locais()
             _CHAT_VERSION[0] += 1
             _ULTIMO_SYNC[0] = time.time()
-            _anunciar_novas()
             return True
         except Exception:
             return False
@@ -556,47 +237,21 @@ def _start_refresher():
         return
     _REFRESHER_STARTED = True
     _sync_chat()
-    _marcar_existentes()
     _sync_tasks()
-    if os.environ.get("SPOOK_REFRESHER") != "1":
-        _log("refresher NAO iniciado (set SPOOK_REFRESHER=1 no servico)")
-        return
     threading.Thread(target=_loop, daemon=True).start()
-
-
-def _log(msg):
-    try:
-        import sys as _s
-        print("[hub_store] " + str(msg), file=_s.stderr, flush=True)
-    except Exception:
-        pass
-
-
-def _safe(nome, fn):
-    """Roda um passo do refresher sem JAMAIS derrubar o loop: antes, uma
-    excecao num unico item (rclone travado, Drive instavel) matava o while
-    True e o relay parava de sincronizar com o Drive para sempre -- foi o que
-    deixou 3 mensagens e todos os relatorios presos no outbox por 3 dias."""
-    try:
-        return fn()
-    except Exception as e:
-        _log(nome + " falhou: " + type(e).__name__ + ": " + str(e)[:160])
-        return None
 
 
 def _loop():
     while True:
-        _safe("flush_pending", _flush_pending)   # sobe os nossos
-        _safe("sync_chat", _sync_chat)           # so o processo com o flock sincroniza
+        _flush_pending()  # sobe os nossos; nao depende do sync
+        _sync_chat()      # so o processo que pegar o flock sincroniza
         time.sleep(1)
-        _safe("sync_tasks", _sync_tasks)
-        _safe("aplica_pendentes", _aaplica_pendentes_locais)
+        _sync_tasks()
+        _aaplica_pendentes_locais()  # garante que nada nosso sumiu do espelho
         time.sleep(max(2, _REFRESHER_INTERVAL - 1))
 
 
-# (chamada do refresher movida para o FIM do modulo: a thread subia
-# durante o import e chamava _remoto_tem/_sync_tasks ainda por definir,
-# quebrando o flush com NameError.)
+_start_refresher()
 
 
 def _ler_cache_tasks():
@@ -677,33 +332,14 @@ def _flush_tpending():
             rec = _TPEND.get(tid)
             if not rec:
                 continue
-            # LWW por ts: se o espelho local (que espelha o Drive) ja tem versao
-            # MAIS NOVA que a pendencia, a pendencia foi superada por outra maquina —
-            # descarta sem subir (senao o copyto velho sobrescrevia o Drive e a ordem
-            # divergia / feito desfazia no outro lado).
-            try:
-                m_ts = int(json.loads((_TASKS_DIR / (tid + ".json")).read_text()).get("ts", 0) or 0)
-            except Exception:
-                m_ts = None
-            if m_ts is None:
-                pass
-            elif m_ts > int(rec.get("ts", 0) or 0):
-                # __del: task tocada/criada DEPOIS do delete -> vale a mais nova.
-                # create/update: pendencia superada por outra maquina -> descarta.
-                _TPEND.pop(tid, None)
-                _tsalvar()
-                continue
             if rec.get("__del"):
                 if _remoto_tem(f"{TASKS}/{tid}.json"):
                     _run(["deletefile", _base(f"{TASKS}/{tid}.json")], check=False)
                 alvo = False
             else:
-                # SEMPRE sobe: copyto incondicional. O gate antigo ("só sobe se
-                # o arquivo ainda NAO existe no Drive") fazia update de task
-                # existente (marcar feito) ficar preso no pendente para sempre —
-                # a mudanca nunca chegava ao Drive nem ao outro lado.
                 _gravar_task_local(rec)
-                _run(["copyto", str(_TASKS_DIR / f"{tid}.json"), _base(f"{TASKS}/{tid}.json")], check=False)
+                if not _remoto_tem(f"{TASKS}/{tid}.json"):
+                    _run(["copyto", str(_TASKS_DIR / f"{tid}.json"), _base(f"{TASKS}/{tid}.json")], check=False)
                 alvo = True
             # so da como confirmado quando a LISTA do Drive refletir a mudanca;
             # enquanto isso o pendente continua vivo (pin + merge no listar)
@@ -747,14 +383,7 @@ def _aaplica_tpend_locais():
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
     for rec in _TPEND.values():
-        if rec.get("__del") or not rec.get("id"):
-            continue
-        f = _TASKS_DIR / (rec["id"] + ".json")
-        try:
-            ant = json.loads(f.read_text())
-        except Exception:
-            ant = None
-        if ant is None or int(rec.get("ts", 0) or 0) >= int(ant.get("ts", 0) or 0):
+        if not rec.get("__del"):
             _gravar_task_local(rec)
 
 
@@ -795,12 +424,7 @@ def _merge_tasks(local: dict, remote: dict) -> dict:
 
 
 def _sorted_tasks(merged: dict):
-    # Ordem deterministica (feito por ultimo, mais recente primeiro, desempate por id)
-    # para as DUAS maquinas renderizarem identico.
-    return sorted(
-        merged.values(),
-        key=lambda t: (t.get("feito", False), -int(t.get("ts", 0) or 0), t.get("id", "")),
-    )
+    return sorted(merged.values(), key=lambda t: (t.get("feito", False), -t.get("ts", 0)))
 
 
 def _base(rel):
@@ -834,24 +458,6 @@ def _remoto_tem(rel, timeout=40):
         return False
 
 
-def _ts_num(msg, f):
-    """ts utilizavel: nunca None/vazio (senão o sorted estoura TypeError e o
-    chat inteiro some). Cai no mtime do arquivo como ultimo recurso."""
-    ts = msg.get("ts")
-    if isinstance(ts, bool):
-        ts = None
-    if isinstance(ts, (int, float)):
-        return int(ts)
-    if isinstance(ts, str):
-        t = ts.strip()
-        if t.lstrip("-").isdigit():
-            return int(t)
-    try:
-        return int(f.stat().st_mtime * 1000)
-    except Exception:
-        return 0
-
-
 def _ler_chat_local():
     """Lê todas as msgs de disco (espelho local), em memória. Inventário do rclone fica de fora."""
     msgs = []
@@ -861,19 +467,12 @@ def _ler_chat_local():
                 continue
             try:
                 msg = json.loads(f.read_text())
+                if isinstance(msg, dict) and msg.get("id"):
+                    msg["_arquivo"] = str(f)
+                    msgs.append(msg)
             except Exception:
                 continue
-            # registro precisa de id e de conteudo (texto ou arquivo)
-            if not isinstance(msg, dict) or not msg.get("id"):
-                continue
-            if msg.get("id") in _TOMBS:   # lapide: nunca reaparece na view
-                continue
-            if not (msg.get("texto") or msg.get("arquivo") or msg.get("tipo") == "arquivo"):
-                continue
-            msg["ts"] = _ts_num(msg, f)
-            msg["_arquivo"] = str(f)
-            msgs.append(msg)
-    return sorted(msgs, key=lambda m: m["ts"])
+    return sorted(msgs, key=lambda m: m.get("ts", 0))
 
 
 def _escrever_json(caminho, msg):
@@ -906,8 +505,6 @@ def listar_mensagens():
 
 
 def apagar_mensagem(msg_id):
-    _tombs_carregar()
-    marcar_apagado(msg_id)
     # local-first: remove do espelho ja; deletefile roda em background
     _delete_local(msg_id)
     fd = _pend_lock()
@@ -1111,11 +708,7 @@ def listar_tasks():
         fcntl.flock(fd, fcntl.LOCK_UN)
         fd.close()
     for tid, rec in pend.items():
-        if rec.get("__del") or not rec.get("id"):
-            continue
-        # LWW por ts: pendencia NUNCA sobrescreve o espelho com versao mais velha
-        # (ordem divergia entre maquinas quando um pendente stale era mergido).
-        if tid not in locais or int(rec.get("ts", 0) or 0) >= int(locais[tid].get("ts", 0) or 0):
+        if not rec.get("__del") and rec.get("id"):
             locais[tid] = rec
     # cache so espelha o presente (nao deixa task apagada ressuscitar)
     _salvar_cache_tasks(locais)
@@ -1168,7 +761,6 @@ def marcar_task(task_id, feito):
 
 
 def apagar_task(task_id):
-    agora = int(time.time() * 1000)
     with _TASKS_LOCK:
         merged = _ler_cache_tasks()
         merged.pop(task_id, None)
@@ -1177,7 +769,7 @@ def apagar_task(task_id):
             (_TASKS_DIR / f"{task_id}.json").unlink(missing_ok=True)
         except Exception:
             pass
-        _tpin({"id": task_id, "__del": True, "ts": agora})
+        _tpin({"id": task_id, "__del": True})
     return _sorted_tasks(merged)
 
 
@@ -1220,5 +812,714 @@ def listar_media():
     return sorted(nomes)
 
 
-# so agora, com o modulo inteiro carregado, o refresher pode subir
-_start_refresher()
+
+
+
+# ============================ LIVROS (prateleira + posicoes) ============================
+# Uma FICHA por livro (bookId = sha256 do conteudo do arquivo). Substitui o par
+# antigo spook_reading_local/<bookId>.json (posicao) + livros_local/<deviceId>.json
+# (lista inteira por dispositivo). Aquele desenho obrigava reenviar a biblioteca
+# toda a cada "feito"/"excluir" e nao sabia representar remocao: o livro apagado
+# num dispositivo voltava pelo outro no proximo envio.
+#
+# Convergencia (last-write-wins por timestamp do CLIENTE, para funcionar offline):
+#   done     -> doneEm / donePor        (desmarcar tambem vence)
+#   removido -> removidoEm / removidoPor (tombstone: some da lista, arquivo fica)
+#   retomar  -> so escrita de leitura real (origem != "restaurado"), nunca o eco
+#               de uma posicao que o cliente acabou de restaurar
+# Arquivos sao content-addressed: reading/arquivos/<bookId>.<ext> (nome = hash),
+# entao renomear nao quebra nada e o cliente valida o sha256 depois do download.
+import hashlib
+import shutil
+
+LIVROS_DIR = _DADOS / "livros"
+LIVROS_DIR.mkdir(parents=True, exist_ok=True)
+LIVROS_ARQ_DIR = _DADOS / "livros_arquivos"
+LIVROS_ARQ_DIR.mkdir(parents=True, exist_ok=True)
+DRIVE_LIVROS_REL = "reading/livros"
+DRIVE_ARQ_REL = "reading/arquivos"
+
+_LIV_WRITE_LOCK = threading.Lock()
+_MIRROR_LOCK = threading.Lock()
+_MIRROR_PEDIDOS = {}                 # bookId -> {"forcar": bool, "em": float}
+_MIRROR_INTERVALO_POS = 45.0         # posicao: no maximo 1 upload por livro/45s
+_MIRROR_INICIADO = False
+_PULL_LIVROS_INICIADO = False
+
+
+def _book_id_ok(book_id):
+    b = str(book_id or "").strip().lower()
+    if len(b) != 64:
+        return None
+    if any(c not in "0123456789abcdef" for c in b):
+        return None
+    return b
+
+
+def _mime_de(ext):
+    return {
+        "pdf": "application/pdf",
+        "epub": "application/epub+zip",
+    }.get((ext or "").lower(), "application/octet-stream")
+
+
+def _sha256_arquivo(caminho):
+    h = hashlib.sha256()
+    with open(caminho, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _path_livro(book_id):
+    return LIVROS_DIR / f"{book_id}.json"
+
+
+def _registro_novo(book_id):
+    return {
+        "schema": 2,
+        "bookId": book_id,
+        "titulo": "",
+        "ext": "",
+        "mimeType": "",
+        "tamanho": 0,
+        "criadoEm": 0,
+        "criadoPor": "",
+        "atualizadoEm": 0,
+        "done": False,
+        "doneEm": 0,
+        "donePor": "",
+        "removido": False,
+        "removidoEm": 0,
+        "removidoPor": "",
+        "arquivo": {"noDrive": False, "nome": None, "tamanho": 0, "enviadoEm": 0},
+        "posicoes": {},
+        "retomar": {"page": 0, "offsetY": 0.0, "percent": 0.0, "device": "", "em": 0},
+    }
+
+
+def obter_livro(book_id):
+    b = _book_id_ok(book_id)
+    if not b:
+        return None
+    try:
+        p = _path_livro(b)
+        if not p.exists():
+            return None
+        r = json.loads(p.read_text())
+        base = _registro_novo(b)
+        base.update(r or {})
+        base["arquivo"] = {**_registro_novo(b)["arquivo"], **(r.get("arquivo") or {})}
+        base["retomar"] = {**_registro_novo(b)["retomar"], **(r.get("retomar") or {})}
+        base["posicoes"] = r.get("posicoes") or {}
+        base["bookId"] = b
+        return base
+    except Exception:
+        return None
+
+
+def _pedir_espelho(book_id, forcar=False):
+    with _MIRROR_LOCK:
+        atual = _MIRROR_PEDIDOS.get(book_id)
+        if atual and atual.get("forcar") and not forcar:
+            return
+        _MIRROR_PEDIDOS[book_id] = {"forcar": bool(forcar), "em": time.time()}
+
+
+def _gravar_livro(rec, forcar_espelho=False):
+    b = rec["bookId"]
+    p = _path_livro(b)
+    with _LIV_WRITE_LOCK:
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2))
+        os.replace(tmp, p)
+    _pedir_espelho(b, forcar_espelho)
+    _iniciar_espelho()
+    return rec
+
+
+def _espelhar_livro(book_id):
+    """Sobe a ficha para o Drive. Devolve False p/ o chamador re-tentar."""
+    if not _path_livro(book_id).exists():
+        return True
+    try:
+        fd = _upload_lock()
+        try:
+            _run(["copyto", str(_path_livro(book_id)),
+                  _base(f"{DRIVE_LIVROS_REL}/{book_id}.json")], timeout=90)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            fd.close()
+        return True
+    except Exception:
+        return False
+
+
+def _loop_espelho():
+    while True:
+        try:
+            agora = time.time()
+            prontos = []
+            with _MIRROR_LOCK:
+                for bid, ped in list(_MIRROR_PEDIDOS.items()):
+                    if ped["forcar"] or (agora - ped["em"]) >= _MIRROR_INTERVALO_POS:
+                        prontos.append((bid, ped["forcar"]))
+                        _MIRROR_PEDIDOS.pop(bid, None)
+            for bid, forcar in prontos:
+                if not _espelhar_livro(bid):
+                    with _MIRROR_LOCK:
+                        atual = _MIRROR_PEDIDOS.get(bid) or {}
+                        _MIRROR_PEDIDOS[bid] = {"forcar": forcar or atual.get("forcar", False),
+                                                "em": min(agora, atual.get("em", agora))}
+        except Exception:
+            pass
+        time.sleep(3)
+
+
+def _iniciar_espelho():
+    global _MIRROR_INICIADO
+    if _MIRROR_INICIADO:
+        return
+    _MIRROR_INICIADO = True
+    threading.Thread(target=_loop_espelho, daemon=True).start()
+
+
+def _pull_livros():
+    """Puxa fichas do Drive (nunca apaga local: copy, nao sync). No boot e de vez
+    em quando. --update garante que um arquivo local mais novo nao seja sobrescrito."""
+    fd = _acquire_sync_lock()
+    if fd is None:
+        return False
+    try:
+        _run(["copy", "--update", "--fast-list", _base(DRIVE_LIVROS_REL), str(LIVROS_DIR)],
+             check=False, timeout=180)
+        return True
+    except Exception:
+        return False
+    finally:
+        _release_sync_lock(fd)
+
+
+def _loop_pull_livros():
+    while True:
+        try:
+            _pull_livros()
+        except Exception:
+            pass
+        time.sleep(120)
+
+
+def _iniciar_pull_livros():
+    global _PULL_LIVROS_INICIADO
+    if _PULL_LIVROS_INICIADO:
+        return
+    _PULL_LIVROS_INICIADO = True
+    threading.Thread(target=_loop_pull_livros, daemon=True).start()
+
+
+def listar_livros(incluir_removidos=False):
+    """Prateleira. Ordena por ultima LEITURA (retomar.em), depois por atualizacao."""
+    out = []
+    try:
+        for p in LIVROS_DIR.glob("*.json"):
+            r = obter_livro(p.stem)
+            if not r:
+                continue
+            if not incluir_removidos and r.get("removido"):
+                continue
+            r["disponivel"] = bool(caminho_arquivo_livro(r["bookId"]))
+            r["noDrive"] = bool((r.get("arquivo") or {}).get("noDrive"))
+            out.append(r)
+    except Exception:
+        return []
+    out.sort(key=lambda x: (x.get("retomar") or {}).get("em") or x.get("atualizadoEm") or 0, reverse=True)
+    return out
+
+
+def _posicao_ou_zero(d):
+    return {
+        "page": int(d.get("page") or 0),
+        "offsetY": float(d.get("offsetY") or 0.0),
+        "percent": float(d.get("percent") or 0.0),
+        "em": int(d.get("em") or 0),
+    }
+
+
+def atualizar_livro(book_id, patch):
+    """Aplica um patch parcial numa ficha com LWW por timestamp do cliente."""
+    b = _book_id_ok(book_id)
+    if not b:
+        return None
+    d = patch or {}
+    rec = obter_livro(b) or _registro_novo(b)
+    agora = int(time.time() * 1000)
+    device = str(d.get("deviceId") or d.get("dispositivo") or "").strip()[:48]
+    mudou_meta = False
+
+    for campo in ("titulo", "ext", "mimeType"):
+        if d.get(campo) and not rec.get(campo):
+            rec[campo] = str(d[campo])[:400]
+            mudou_meta = True
+    if d.get("tamanho") and not rec.get("tamanho"):
+        try:
+            rec["tamanho"] = int(d["tamanho"])
+            mudou_meta = True
+        except Exception:
+            pass
+    if not rec.get("mimeType") and rec.get("ext"):
+        rec["mimeType"] = _mime_de(rec["ext"])
+    if not rec.get("criadoEm"):
+        rec["criadoEm"] = agora
+        rec["criadoPor"] = device
+
+    if "done" in d:
+        done_em = int(d.get("doneEm") or agora)
+        if done_em >= int(rec.get("doneEm") or 0):
+            rec["done"] = bool(d.get("done"))
+            rec["doneEm"] = done_em
+            rec["donePor"] = str(d.get("donePor") or device)
+            mudou_meta = True
+
+    if "removido" in d:
+        rem_em = int(d.get("removidoEm") or agora)
+        if rem_em >= int(rec.get("removidoEm") or 0):
+            rec["removido"] = bool(d.get("removido"))
+            rec["removidoEm"] = rem_em
+            rec["removidoPor"] = str(d.get("removidoPor") or device)
+            mudou_meta = True
+
+    arq = d.get("arquivo")
+    if isinstance(arq, dict) and arq.get("nome"):
+        base_arq = rec.get("arquivo") or {}
+        if (not base_arq.get("noDrive")) or arq.get("noDrive"):
+            rec["arquivo"] = {**base_arq, **arq}
+            if not rec.get("ext"):
+                nome_arq = str(arq.get("nome"))
+                if "." in nome_arq:
+                    rec["ext"] = nome_arq.rsplit(".", 1)[-1].lower()
+                    rec["mimeType"] = _mime_de(rec["ext"])
+            mudou_meta = True
+
+    if device and d.get("page") is not None:
+        em = int(d.get("em") or agora)
+        if em <= 0:
+            em = agora
+        if em > agora + 300_000:      # relogio do cliente muito no futuro
+            em = agora
+        ant = (rec.get("posicoes") or {}).get(device) or {}
+        if em >= int(ant.get("em") or 0):
+            rec.setdefault("posicoes", {})[device] = _posicao_ou_zero({**d, "em": em})
+            origem = str(d.get("origem") or "leitura")
+            ret = rec.get("retomar") or {}
+            if origem != "restaurado" and em > int(ret.get("em") or 0):
+                rec["retomar"] = {**_posicao_ou_zero({**d, "em": em}), "device": device}
+                mudou_meta = True
+            _pedir_espelho(b, False)
+
+    rec["atualizadoEm"] = agora
+    return _gravar_livro(rec, forcar_espelho=mudou_meta)
+
+
+def publicar_livro(origem, book_id=None, titulo="", ext="", device="", forcar_upload=True):
+    """Registra um arquivo (PDF/EPUB) na prateleira e sobe pro Drive.
+    O nome no Drive e o sha256 do conteudo: identidade independente de nome."""
+    try:
+        p = Path(origem)
+        if not p.exists() or p.stat().st_size == 0:
+            return None
+        ext = (ext or p.suffix.lstrip(".")).lower()
+        if ext not in ("pdf", "epub"):
+            return None
+        calc = _sha256_arquivo(p)
+        b = calc
+        if book_id and _book_id_ok(book_id) and _book_id_ok(book_id) != calc:
+            # arquivo nao corresponde ao id que o cliente mandou: o conteudo manda
+            b = calc
+        dest = LIVROS_ARQ_DIR / f"{b}.{ext}"
+        if p.resolve() != dest.resolve():
+            shutil.copyfile(p, dest)
+
+        no_drive = False
+        if forcar_upload:
+            try:
+                fd = _upload_lock()
+                try:
+                    _run(["copyto", str(dest), _base(f"{DRIVE_ARQ_REL}/{b}.{ext}")], timeout=900)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    fd.close()
+                no_drive = True
+            except Exception:
+                no_drive = False
+
+        agora = int(time.time() * 1000)
+        rec = obter_livro(b) or _registro_novo(b)
+        rec["titulo"] = rec.get("titulo") or titulo or p.stem
+        rec["ext"] = ext
+        rec["mimeType"] = _mime_de(ext)
+        rec["tamanho"] = dest.stat().st_size
+        rec["arquivo"] = {
+            "noDrive": no_drive,
+            "nome": f"{b}.{ext}",
+            "tamanho": dest.stat().st_size,
+            "enviadoEm": agora if no_drive else 0,
+        }
+        # reimportar limpa a tombstone (LWW: agora > remocao antiga)
+        rec["removido"] = False
+        rec["removidoEm"] = agora
+        rec["removidoPor"] = device
+        if not rec.get("criadoEm"):
+            rec["criadoEm"] = agora
+            rec["criadoPor"] = device
+        rec["atualizadoEm"] = agora
+        _gravar_livro(rec, forcar_espelho=True)
+        return rec
+    except Exception:
+        return None
+
+
+def caminho_arquivo_livro(book_id):
+    b = _book_id_ok(book_id)
+    if not b:
+        return None
+    try:
+        for f in LIVROS_ARQ_DIR.glob(f"{b}.*"):
+            if f.is_file() and f.stat().st_size > 0:
+                return f
+    except Exception:
+        pass
+    return None
+
+
+def baixar_arquivo_livro(book_id):
+    """Devolve o Path local do arquivo, baixando do Drive se preciso."""
+    b = _book_id_ok(book_id)
+    if not b:
+        return None
+    local = caminho_arquivo_livro(b)
+    if local:
+        return local
+    rec = obter_livro(b) or {}
+    ext = (rec.get("ext") or "").lower()
+    nome = (rec.get("arquivo") or {}).get("nome") or (f"{b}.{ext}" if ext else "")
+    if not nome:
+        return None
+    dest = LIVROS_ARQ_DIR / nome
+    fd = _acquire_sync_lock()
+    try:
+        _run(["copyto", _base(f"{DRIVE_ARQ_REL}/{nome}"), str(dest)], timeout=900)
+    except Exception:
+        return None
+    finally:
+        if fd is not None:
+            _release_sync_lock(fd)
+    if dest.exists() and dest.stat().st_size > 0:
+        return dest
+    return None
+
+
+def apagar_livro(book_id, device="", apagar_arquivo=False):
+    """Remove da lista = tombstone. Por padrao NAO apaga o arquivo do Drive."""
+    rec = obter_livro(book_id)
+    if not rec:
+        return None
+    agora = int(time.time() * 1000)
+    rec["removido"] = True
+    rec["removidoEm"] = agora
+    rec["removidoPor"] = str(device)
+    rec["atualizadoEm"] = agora
+    if apagar_arquivo:
+        try:
+            nome = (rec.get("arquivo") or {}).get("nome")
+            if nome:
+                _run(["deletefile", _base(f"{DRIVE_ARQ_REL}/{nome}")], check=False, timeout=120)
+            local = caminho_arquivo_livro(book_id)
+            if local:
+                local.unlink(missing_ok=True)
+            rec["arquivo"] = {"noDrive": False, "nome": nome, "tamanho": 0, "enviadoEm": 0}
+        except Exception:
+            pass
+    return _gravar_livro(rec, forcar_espelho=True)
+
+
+# ---------- compatibilidade com o protocolo antigo (leitura_* / livros_*) ----------
+
+def obter_leitura(book_id):
+    """Shape antigo (spook_reading_local) derivado da ficha nova."""
+    rec = obter_livro(book_id)
+    if not rec:
+        return None
+    r = rec.get("retomar") or {}
+    return {
+        "bookId": rec["bookId"],
+        "title": rec.get("titulo", ""),
+        "mimeType": rec.get("mimeType", ""),
+        "devices": {
+            k: {"page": v.get("page"), "offsetY": v.get("offsetY"),
+                "percent": v.get("percent"), "updatedAt": v.get("em")}
+            for k, v in (rec.get("posicoes") or {}).items()
+        },
+        "lastPage": r.get("page", 0),
+        "lastOffsetY": r.get("offsetY", 0.0),
+        "lastPercent": r.get("percent", 0.0),
+        "lastDevice": r.get("device", ""),
+        "createdAt": rec.get("criadoEm", 0),
+        "updatedAt": rec.get("atualizadoEm", 0),
+        "done": rec.get("done", False),
+        "removido": rec.get("removido", False),
+    }
+
+
+def atualizar_leitura(book_id, dados):
+    rec = atualizar_livro(book_id, dados or {})
+    return obter_leitura(rec["bookId"]) if rec else None
+
+
+def obter_todos_livros(excluir_deviceId=None):
+    """Compat: devolve a prateleira no shape antigo (lista de livros)."""
+    out = []
+    for r in listar_livros():
+        out.append({
+            "bookId": r["bookId"],
+            "titulo": r.get("titulo", ""),
+            "mimeType": r.get("mimeType", ""),
+            "tamanho": r.get("tamanho", 0),
+            "ext": r.get("ext", ""),
+            "done": r.get("done", False),
+            "caminho": None,
+            "noDrive": bool((r.get("arquivo") or {}).get("noDrive")),
+        })
+    return out
+
+
+def salvar_livros(device_id, livros):
+    """Compat com o APK antigo, que manda a lista INTEIRA do dispositivo.
+    Upserta o que veio e vira tombstone o que sumiu (era o bug da ressurreicao)."""
+    try:
+        safe = "".join(c for c in str(device_id) if c.isalnum() or c in "-_")
+        snap_dir = _DADOS / "livros_local"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        snap = snap_dir / (safe + ".json")
+        anteriores = set()
+        estado_anterior = {}
+        try:
+            if snap.exists():
+                arr = json.loads(snap.read_text())
+                anteriores = {l.get("bookId") for l in arr if isinstance(l, dict)}
+                estado_anterior = {l.get("bookId"): bool(l.get("done")) for l in arr if isinstance(l, dict)}
+        except Exception:
+            anteriores = set()
+            estado_anterior = {}
+        agora = int(time.time() * 1000)
+        vistos = set()
+        for l in (livros or []):
+            if not isinstance(l, dict):
+                continue
+            bid = _book_id_ok(l.get("bookId"))
+            if not bid:
+                continue
+            vistos.add(bid)
+            patch = {
+                "titulo": l.get("titulo", ""),
+                "ext": l.get("ext", ""),
+                "tamanho": l.get("tamanho", 0),
+                "deviceId": device_id,
+            }
+            # so manda done quando MUDOU em relacao ao snapshot: o APK antigo
+            # reenvia a lista inteira e, sem isso, carimbaria doneEm=agora em
+            # todo livro e venceria um "feito" marcado no outro aparelho.
+            if bid not in estado_anterior or estado_anterior[bid] != bool(l.get("done")):
+                patch["done"] = bool(l.get("done"))
+                patch["doneEm"] = agora
+            atualizar_livro(bid, patch)
+        for antigo in anteriores - vistos:
+            apagar_livro(antigo, device=device_id)
+        snap.write_text(json.dumps(livros, ensure_ascii=False))
+        return True
+    except Exception:
+        return False
+
+
+def listar_livros_drive():
+    """Compat com o botao GOOGLE DRIVE do Arch antigo."""
+    out = []
+    for r in listar_livros():
+        nome = (r.get("arquivo") or {}).get("nome") or f"{r['bookId']}.{r.get('ext', 'pdf')}"
+        out.append({
+            "bookId": r["bookId"],
+            "titulo": r.get("titulo", ""),
+            "nome_arquivo": nome,
+            "tamanho": r.get("tamanho", 0),
+            "ext": r.get("ext", "pdf"),
+            "modificado": "",
+            "done": r.get("done", False),
+            "noDrive": bool((r.get("arquivo") or {}).get("noDrive")),
+        })
+    return out
+
+
+def _migra_livros_v1():
+    """Converte os dois arquivos antigos em fichas por livro. Roda uma vez."""
+    marca = _DADOS / ".livros_v2_migrado"
+    if marca.exists():
+        return
+    tocados = 0
+    try:
+        antigos = _DADOS / "spook_reading_local"
+        if antigos.exists():
+            for p in antigos.glob("*.json"):
+                if not _book_id_ok(p.stem):
+                    continue                      # test-book-*: lixo de teste
+                try:
+                    d = json.loads(p.read_text())
+                except Exception:
+                    continue
+                rec = obter_livro(p.stem) or _registro_novo(p.stem)
+                rec["titulo"] = rec.get("titulo") or d.get("title", "")
+                rec["mimeType"] = rec.get("mimeType") or d.get("mimeType", "")
+                pos = {}
+                for dev, v in (d.get("devices") or {}).items():
+                    if v.get("page") is None:
+                        continue
+                    pos[dev] = {
+                        "page": int(v.get("page") or 0),
+                        "offsetY": float(v.get("offsetY") or 0),
+                        "percent": float(v.get("percent") or 0),
+                        "em": int(v.get("updatedAt") or 0),
+                    }
+                rec["posicoes"] = pos or rec.get("posicoes") or {}
+                if d.get("lastDevice") and d.get("lastPage") is not None:
+                    rec["retomar"] = {
+                        "page": int(d.get("lastPage") or 0),
+                        "offsetY": float(d.get("lastOffsetY") or 0),
+                        "percent": float(d.get("lastPercent") or 0),
+                        "device": d.get("lastDevice"),
+                        "em": int(d.get("updatedAt") or 0),
+                    }
+                rec["criadoEm"] = rec.get("criadoEm") or int(d.get("createdAt") or 0)
+                rec["atualizadoEm"] = int(d.get("updatedAt") or 0)
+                _gravar_livro(rec, forcar_espelho=True)
+                tocados += 1
+
+        lista_antiga = _DADOS / "livros_local"
+        if lista_antiga.exists():
+            for p in lista_antiga.glob("*.json"):
+                try:
+                    arr = json.loads(p.read_text())
+                except Exception:
+                    continue
+                for l in (arr or []):
+                    bid = _book_id_ok(l.get("bookId"))
+                    if not bid:
+                        continue
+                    rec = obter_livro(bid) or _registro_novo(bid)
+                    rec["titulo"] = rec.get("titulo") or l.get("titulo", "")
+                    rec["ext"] = rec.get("ext") or (l.get("ext") or "").lower()
+                    rec["mimeType"] = rec.get("mimeType") or l.get("mimeType") or _mime_de(rec.get("ext"))
+                    rec["tamanho"] = rec.get("tamanho") or int(l.get("tamanho") or 0)
+                    if l.get("done"):
+                        rec["done"] = True
+                        rec["doneEm"] = rec.get("doneEm") or int(time.time() * 1000)
+                        rec["donePor"] = rec.get("donePor") or p.stem
+                    rec["criadoEm"] = rec.get("criadoEm") or int(time.time() * 1000)
+                    rec["criadoPor"] = rec.get("criadoPor") or p.stem
+                    _gravar_livro(rec, forcar_espelho=True)
+                    tocados += 1
+        marca.write_text(json.dumps({"em": int(time.time() * 1000), "fichas": tocados}))
+    except Exception:
+        pass
+
+
+_migra_livros_v1()
+_iniciar_pull_livros()
+_iniciar_espelho()
+
+
+# ============================ RELATORIOS (Drive gdrive:SPOOK/relatorios) ============================
+_RELATORIOS_DIR = Path(os.environ.get("SPOOK_RELATORIOS_DIR", str(_DADOS / "relatorios")))
+_RELATORIOS_DIR.mkdir(parents=True, exist_ok=True)
+
+def _rclone_lsjson_relatorios():
+    """Lista arquivos em gdrive:SPOOK/relatorios via rclone lsjson."""
+    try:
+        r = subprocess.run(
+            ["rclone", "lsjson", "gdrive:SPOOK/relatorios", "--fast-list"],
+            capture_output=True, text=True, timeout=30
+        )
+        if r.returncode != 0:
+            return []
+        return json.loads(r.stdout)
+    except Exception:
+        return []
+
+def listar_relatorios() -> list[dict]:
+    """Lista relatórios do Drive, agrupados por base (sem extensão)."""
+    files = _rclone_lsjson_relatorios()
+    by_base = {}
+    for f in files:
+        name = f.get("Name", "")
+        if not name:
+            continue
+        base = name
+        for ext in [".pdf", ".docx", ".txt", ".log", ".md"]:
+            if base.endswith(ext):
+                base = base[:-len(ext)]
+                break
+        entry = by_base.setdefault(base, {"base": base, "bytes": 0, "modificado": "", "documentos": []})
+        entry["bytes"] += f.get("Size", 0)
+        if f.get("ModTime", "") > entry["modificado"]:
+            entry["modificado"] = f.get("ModTime", "")
+        if name.endswith(".pdf"):
+            entry["documentos"].append("pdf")
+        elif name.endswith(".docx"):
+            entry["documentos"].append("docx")
+        elif name.endswith(".txt") or name.endswith(".log") or name.endswith(".md"):
+            entry["documentos"].append("txt")
+    return list(by_base.values())
+
+def baixar_relatorio(base: str) -> bytes | None:
+    """Texto do relatorio: mirror local primeiro, Drive como reserva.
+
+    O Drive guarda SO o .docx (decisao de 27/09); o .txt que a janela REPORTS
+    renderiza vive no mirror do relay. Ir direto no rclone fazia o app receber
+    o .docx (binario) e a tela mostrava lixo.
+    """
+    try:
+        for ext in [".txt", ".log", ".md", ".pdf", ".docx"]:
+            local = _RELATORIOS_DIR / (base + ext)
+            try:
+                if local.exists() and local.stat().st_size > 0:
+                    return local.read_bytes()
+            except Exception:
+                continue
+        for ext in [".txt", ".log", ".pdf", ".docx", ".md"]:
+            name = base + ext
+            local = _RELATORIOS_DIR / name
+            r = subprocess.run(
+                ["rclone", "copyto", f"gdrive:SPOOK/relatorios/{name}", str(local)],
+                capture_output=True, text=True, timeout=30
+            )
+            if r.returncode == 0 and local.exists():
+                return local.read_bytes()
+        return None
+    except Exception:
+        return None
+
+def apagar_relatorios(bases: list[str]) -> bool:
+    """Apaga relatórios do Drive (todos os arquivos com a base)."""
+    try:
+        files = _rclone_lsjson_relatorios()
+        for base in bases:
+            for f in files:
+                name = f.get("Name", "")
+                if name.startswith(base + ".") or name == base:
+                    subprocess.run(
+                        ["rclone", "deletefile", f"gdrive:SPOOK/relatorios/{name}"],
+                        capture_output=True, timeout=30
+                    )
+                    local = _RELATORIOS_DIR / name
+                    if local.exists():
+                        local.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
