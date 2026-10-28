@@ -8,6 +8,7 @@ import time
 import os
 import json
 import hub_store
+import pad_store
 import fcntl
 
 
@@ -524,6 +525,35 @@ def task_apagar(dados):
     socketio.emit("task_apagada", {"id": tid})
 
 
+# ================================ PAD (notas) ================================
+@socketio.on("pad_listar")
+def pad_listar(dados):
+    emit("pad_lista", {"notas": pad_store.listar()})
+
+
+@socketio.on("pad_salvar")
+def pad_salvar(dados):
+    d = dados or {}
+    res = pad_store.salvar(
+        d.get("id", ""),
+        d.get("titulo", ""),
+        d.get("texto", ""),
+        int(d.get("em") or 0),
+        d.get("base_hash", ""),
+        d.get("device", "android"),
+    )
+    emit("pad_estado", res)
+    if not res.get("conflito") and not res.get("antiga") and not res.get("igual"):
+        socketio.emit("pad_atualizada", res["nota"])
+
+
+@socketio.on("pad_apagar")
+def pad_apagar_socket(dados):
+    nid = (dados or {}).get("id")
+    rec = pad_store.apagar(nid, (dados or {}).get("device", "android"))
+    socketio.emit("pad_apagada", {"id": nid, "removido_em": rec.get("removido_em", 0)})
+
+
 @socketio.on("notificacao_celular")
 def notificacao_recebida_relay(dados):
     """Recebe notificacao do Android (via Arch bridge) e broadcasta pro overlay."""
@@ -998,6 +1028,78 @@ def rota_apagar_relatorios():
         return {"ok": ok}
     except Exception as e:
         return {"ok": False, "erro": str(e)}, 500
+
+# ================================ PAD (HTTP) ================================
+@app.route("/pad", methods=["GET"])
+def rota_listar_pad():
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    return {"ok": True, "notas": pad_store.listar()}
+
+
+@app.route("/pad/<nid>", methods=["GET"])
+def rota_obter_pad(nid):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    rec = pad_store.obter(nid)
+    if not rec:
+        return {"ok": False, "erro": "nao_encontrada"}, 404
+    return {"ok": True, "nota": rec}
+
+
+@app.route("/pad", methods=["POST"])
+def rota_criar_pad():
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    d = request.get_json(silent=True) or {}
+    rec = pad_store.criar(
+        d.get("titulo", ""), d.get("texto", ""), d.get("device", "android")
+    )
+    return {"ok": True, "nota": rec}
+
+
+@app.route("/pad/<nid>", methods=["POST"])
+def rota_salvar_pad(nid):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    d = request.get_json(silent=True) or {}
+    res = pad_store.salvar(
+        nid,
+        d.get("titulo", ""),
+        d.get("texto", ""),
+        int(d.get("em") or 0),
+        d.get("base_hash", ""),
+        d.get("device", "android"),
+    )
+    if "nota" not in res:
+        return {"ok": False, "erro": "falha"}, 500
+    res["ok"] = True
+    return res
+
+
+@app.route("/pad/<nid>", methods=["DELETE"])
+def rota_apagar_pad(nid):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    rec = pad_store.apagar(nid, request.args.get("device", "android"))
+    return {"ok": True, "nota": rec}
+
+
+@app.route("/pad/<nid>/historico", methods=["GET"])
+def rota_historico_pad(nid):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    return {"ok": True, "versoes": pad_store.historico(nid)}
+
+
+@app.route("/pad/<nid>/restaurar", methods=["POST"])
+def rota_restaurar_pad(nid):
+    if not _auth_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    d = request.get_json(silent=True) or {}
+    res = pad_store.restaurar(nid, int(d.get("em") or 0), d.get("device", "android"))
+    return res
+
 
 @app.route("/healthz")
 def health():
