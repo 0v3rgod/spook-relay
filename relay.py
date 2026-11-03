@@ -1076,13 +1076,12 @@ def rota_listar_media():
 def rota_baixar_reading(filename):
     if not _token_ok():
         return {'ok': False, 'erro': 'Unauthorized'}, 401
-    import os
     nome = os.path.basename(str(filename))
     if not nome or '..' in nome:
         return {'ok': False, 'erro': 'not_found'}, 404
     filename = nome
-    import tempfile, subprocess
     try:
+        import subprocess, tempfile, os
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp_path = tmp.name
         r = subprocess.run(['rclone', 'copyto', f'gdrive:SPOOK/reading/{filename}', tmp_path], capture_output=True, timeout=60)
