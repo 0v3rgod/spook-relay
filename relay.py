@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 import hub_store
 import pad_store
 import fcntl
+import ia_provedores
 
 # Load .env for Groq keys
 def _carregar_env(p: Path):
@@ -26,6 +27,7 @@ def _carregar_env(p: Path):
     return dados
 
 _ENV = _carregar_env(Path(__file__).resolve().parent / '.env')
+ia_provedores.configurar(_ENV)
 GROQ_API_KEY = _ENV.get('GROQ_API_KEY', '')
 GROQ_MODEL = _ENV.get('GROQ_MODEL', 'openai/gpt-oss-20b')
 def _token_sessao() -> str:
@@ -160,12 +162,8 @@ def _extrair_fatos(usuario: str, sessao_id: str, perguntas: list):
     if not texto.strip():
         return
     try:
-        r = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-            json={
-                "model": GROQ_MODEL,
-                "messages": [{"role": "user", "content": (
+        bruto, _prov_fatos = ia_provedores.gerar(
+            [{"role": "user", "content": (
                     "Extraia fatos uteis e DURADAVEIS sobre o usuario das mensagens abaixo.\n"
                     "Interessa: nome, preferencias, habitos, projetos, ferramentas, objetivos, "
                     "maquinas que ele usa, problemas recorrentes.\n"
@@ -173,14 +171,10 @@ def _extrair_fatos(usuario: str, sessao_id: str, perguntas: list):
                     "retorne lista vazia.\n"
                     "Responda APENAS com JSON: lista de strings curtas em portugues.\n\n"
                     f"Mensagens:\n{texto}"
-                )}],
-                "max_tokens": 500,
-                "temperature": 0.1,
-            },
-            timeout=30,
+            )}],
+            max_tokens=500,
+            temperatura=0.1,
         )
-        r.raise_for_status()
-        bruto = r.json()["choices"][0]["message"]["content"].strip()
         if bruto.startswith("```"):
             bruto = bruto.strip("`")
             bruto = bruto.split("\n", 1)[1] if "\n" in bruto else bruto
@@ -203,7 +197,7 @@ def _extrair_fatos(usuario: str, sessao_id: str, perguntas: list):
 
 def _talvez_extrair_async(usuario: str, sessao_id: str, pergunta: str):
     """Dispara a extracao em background, no maximo a cada N perguntas do usuario."""
-    if not GROQ_API_KEY or not pergunta.strip():
+    if not ia_provedores.configurados() or not pergunta.strip():
         return
     chave = _safe(usuario)
     n = _ultima_extracao.get(chave, 0) + 1
@@ -227,7 +221,15 @@ def _pergunta_pendente(sessao_id):
     return str(pend or "")
 
 
-ACOES_IA_PERMITIDAS = {'executar_scan', 'executar_comando_notebook', 'obter_info_sistema'}
+ACOES_IA_PERMITIDAS = {
+    'executar_scan', 'executar_comando_notebook', 'obter_info_sistema',
+    # Tasks
+    'obter_tasks', 'criar_task', 'atualizar_task', 'apagar_task',
+    # Notas (Pad)
+    'obter_notas', 'criar_nota', 'atualizar_nota', 'apagar_nota',
+    # Finanças
+    'obter_financas', 'criar_expense', 'atualizar_parcela', 'apagar_expense',
+}
 # Comandos que desligam/reinicializam a maquina NUNCA sao executados pela IA:
 # no app eles pedem confirmacao explicita do usuario (campo "confirmar" do
 # catalogo); a IA nao tem como confirmar, entao e negado aqui e no Arch.
@@ -287,12 +289,148 @@ def _executar_tool_call(tool_call: dict, sessao_id: str) -> dict:
         except Exception as e:
             return {'ok': False, 'erro': f'falha ao enviar comando: {e}'}
 
-    try:
-        socketio.emit('ia_obter_info', {
-            'sessao_id': sessao_id, 'pergunta_original': _pergunta_pendente(sessao_id)})
-        return {'ok': True, 'status': 'info_solicitada'}
-    except Exception as e:
-        return {'ok': False, 'erro': f'falha: {e}'}
+    if acao == 'obter_info_sistema':
+        try:
+            socketio.emit('ia_obter_info', {
+                'sessao_id': sessao_id, 'pergunta_original': _pergunta_pendente(sessao_id)})
+            return {'ok': True, 'status': 'info_solicitada'}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha: {e}'}
+
+    # Tasks
+    if acao == 'obter_tasks':
+        try:
+            tasks = hub_store.listar_tasks()
+            return {'ok': True, 'tasks': tasks}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao listar tasks: {e}'}
+
+    if acao == 'criar_task':
+        titulo = str(params.get('titulo') or '').strip()
+        due_date = int(params.get('due_date') or 0)
+        if not titulo:
+            return {'ok': False, 'erro': 'titulo obrigatorio'}
+        try:
+            nova, lista = hub_store.criar_task(titulo, due_date=due_date)
+            return {'ok': True, 'task': nova}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao criar task: {e}'}
+
+    if acao == 'atualizar_task':
+        task_id = str(params.get('id') or '').strip()
+        feito = params.get('feito')
+        due_date = params.get('due_date')
+        if not task_id:
+            return {'ok': False, 'erro': 'id obrigatorio'}
+        try:
+            updates = {}
+            if feito is not None:
+                updates['feito'] = bool(feito)
+            if due_date is not None:
+                updates['due_date'] = int(due_date)
+            lista = hub_store.atualizar_task(task_id, updates)
+            task = next((t for t in lista if t.get('id') == task_id), {})
+            return {'ok': True, 'task': task}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao atualizar task: {e}'}
+
+    if acao == 'apagar_task':
+        task_id = str(params.get('id') or '').strip()
+        if not task_id:
+            return {'ok': False, 'erro': 'id obrigatorio'}
+        try:
+            hub_store.apagar_task(task_id)
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao apagar task: {e}'}
+
+    # Notas (Pad)
+    if acao == 'obter_notas':
+        try:
+            notas = pad_store.listar()
+            return {'ok': True, 'notas': notas}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao listar notas: {e}'}
+
+    if acao == 'criar_nota':
+        titulo = str(params.get('titulo') or '').strip()
+        texto = str(params.get('texto') or '')
+        if not titulo:
+            return {'ok': False, 'erro': 'titulo obrigatorio'}
+        try:
+            nova = pad_store.criar(titulo, texto, device='ia')
+            return {'ok': True, 'nota': nova}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao criar nota: {e}'}
+
+    if acao == 'atualizar_nota':
+        nid = str(params.get('id') or '').strip()
+        titulo = params.get('titulo')
+        texto = params.get('texto')
+        if not nid:
+            return {'ok': False, 'erro': 'id obrigatorio'}
+        try:
+            atual = pad_store.obter(nid)
+            if not atual:
+                return {'ok': False, 'erro': 'nota nao encontrada'}
+            novo_titulo = titulo if titulo is not None else atual.get('titulo', '')
+            novo_texto = texto if texto is not None else atual.get('texto', '')
+            import time
+            em = int(time.time() * 1000)
+            base_hash = atual.get('base_hash', '')
+            atualizada = pad_store.salvar(nid, novo_titulo, novo_texto, em, base_hash, device='ia')
+            return {'ok': True, 'nota': atualizada}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao atualizar nota: {e}'}
+
+    if acao == 'apagar_nota':
+        nid = str(params.get('id') or '').strip()
+        if not nid:
+            return {'ok': False, 'erro': 'id obrigatorio'}
+        try:
+            pad_store.apagar(nid, device='ia')
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao apagar nota: {e}'}
+
+    # Finanças
+    if acao == 'obter_financas':
+        try:
+            expenses = hub_store.listar_expenses()
+            return {'ok': True, 'expenses': expenses}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao listar financas: {e}'}
+
+    if acao == 'criar_expense':
+        try:
+            expense_data = params or {}
+            nova, lista = hub_store.criar_expense(expense_data)
+            return {'ok': True, 'expense': nova}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao criar expense: {e}'}
+
+    if acao == 'atualizar_parcela':
+        expense_id = str(params.get('expense_id') or params.get('id') or '').strip()
+        parcela_index = params.get('parcela_index')
+        updates = params.get('updates') or {}
+        if not expense_id or parcela_index is None:
+            return {'ok': False, 'erro': 'expense_id e parcela_index obrigatorios'}
+        try:
+            lista = hub_store.atualizar_parcela(expense_id, int(parcela_index), updates)
+            expense = next((e for e in lista if e.get('id') == expense_id), {})
+            return {'ok': True, 'expense': expense}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao atualizar parcela: {e}'}
+
+    if acao == 'apagar_expense':
+        expense_id = str(params.get('id') or '').strip()
+        if not expense_id:
+            return {'ok': False, 'erro': 'id obrigatorio'}
+        try:
+            hub_store.apagar_expense(expense_id)
+            return {'ok': True}
+        except Exception as e:
+            return {'ok': False, 'erro': f'falha ao apagar expense: {e}'}
 
 
 CATALOGO_SCANS = {
@@ -379,6 +517,32 @@ CATALOGO_COMANDOS = {
     ],
 }
 
+_BASE_DIR = Path(__file__).resolve().parent
+_ARQ_CONTEXTO = _BASE_DIR / "contexto_taylor.md"
+_CTX_CACHE = {"mtime": 0.0, "texto": ""}
+
+
+def _contexto_taylor():
+    """Dossie do usuario, editavel sem deploy em ~/spook-relay/contexto_taylor.md.
+
+    Vai no prompt de sistema de TODA pergunta: e assim que a IA sabe quem e o
+    Taylor, como ele trabalha e o que ja foi decidido no projeto.
+    """
+    try:
+        mtime = _ARQ_CONTEXTO.stat().st_mtime
+    except OSError:
+        return ""
+    if mtime != _CTX_CACHE["mtime"]:
+        try:
+            _CTX_CACHE["texto"] = _ARQ_CONTEXTO.read_text(encoding="utf-8")
+            _CTX_CACHE["mtime"] = mtime
+            print("[IA] contexto_taylor.md carregado (%d chars)"
+                  % len(_CTX_CACHE["texto"]), flush=True)
+        except OSError:
+            return ""
+    return _CTX_CACHE["texto"]
+
+
 def montar_instrucoes_ia():
     linhas_scans = []
     for secao, itens in CATALOGO_SCANS.items():
@@ -397,14 +561,29 @@ def montar_instrucoes_ia():
         "Pode usar quebras de linha curtas para separar paragrafos. "
         "Voce pode ajudar com qualquer assunto: tecnologia, pentest, redes, Linux, programacao, e tambem com "
         "perguntas gerais do dia a dia. "
-        "Quando o usuario pedir para executar um scan ou comando do proprio app, voce pode:\n"
+        "Quando o usuario pedir para executar um scan, comando, ou gerenciar tasks/notas/financas do app, voce pode:\n"
         "1) Explicar como fazer\n"
-        "2) Emitir um evento de acao para o sistema executar (scans no Termux, comandos no notebook)\n"
+        "2) Emitir um evento de acao para o sistema executar\n"
         "Sempre pergunte confirmacao antes de executar algo destrutivo.\n\n"
         "QUANDO O USUARIO PEDIR PARA EXECUTAR ACAO DO CATALOGO, responda em JSON:\n"
         '<system>\n{"tool_call": {"acao": "<acao>", "params": {"<nome_param>": "<valor>"}}}\n</system>\n'
-        "onde acao pode ser: executar_scan (params: scan, alvo), executar_comando_notebook (params: comando), "
-        "obter_info_sistema (sem params). Responda SO o JSON acima, sem texto extra, quando a acao for pedida. "
+        "Acoes disponiveis:\n"
+        "- executar_scan (params: scan, alvo)\n"
+        "- executar_comando_notebook (params: comando)\n"
+        "- obter_info_sistema (sem params)\n"
+        "- obter_tasks (sem params) - lista todas as tasks\n"
+        "- criar_task (params: titulo, due_date_opcional) - cria task\n"
+        "- atualizar_task (params: id, feito_opcional, due_date_opcional) - atualiza task\n"
+        "- apagar_task (params: id) - apaga task\n"
+        "- obter_notas (sem params) - lista todas as notas\n"
+        "- criar_nota (params: titulo, texto_opcional) - cria nota\n"
+        "- atualizar_nota (params: id, titulo_opcional, texto_opcional) - atualiza nota\n"
+        "- apagar_nota (params: id) - apaga nota\n"
+        "- obter_financas (sem params) - lista todas as despesas\n"
+        "- criar_expense (params: titulo, payment_method, total_amount, installments_opcional, installment_amount_opcional, first_due_date_opcional, parcelas_opcional) - cria despesa\n"
+        "- atualizar_parcela (params: expense_id, parcela_index, updates: {paga, paidDate, valor}) - atualiza parcela\n"
+        "- apagar_expense (params: id) - apaga despesa\n"
+        "Responda SO o JSON acima, sem texto extra, quando a acao for pedida. "
         "Fora de pedidos de acao, responda normalmente em texto.\n\n"
         "Catalogo de scans e comandos do app (referencia):\n"
         f"{catalogo}\n\n"
@@ -454,7 +633,8 @@ def _on_ia_agente_resposta(dados):
         espera['dados'] = dados
         espera['evento'].set()
 
-def _perguntar_agente_arch(pergunta, usuario, sessao_id, timeout=200):
+def _perguntar_agente_arch(pergunta, usuario, sessao_id, timeout=200,
+                           livre=False, system=None):
     pedido_id = uuid.uuid4().hex
     evento = threading.Event()
     with _AGENTE_LOCK:
@@ -465,6 +645,8 @@ def _perguntar_agente_arch(pergunta, usuario, sessao_id, timeout=200):
             'usuario': usuario,
             'sessao_id': sessao_id,
             'pedido_id': pedido_id,
+            'livre': bool(livre),
+            'system': system or '',
         })
         if evento.wait(timeout):
             return _AGENTE_PEDIDOS[pedido_id]['dados']
@@ -482,18 +664,21 @@ def conectar_ia(auth=None):
     if not TOKEN_SESSAO or not _token_igual(token):
         print('[RELAY] /ia conexao negada: token invalido', flush=True)
         return False
-    if GROQ_API_KEY or _agente_disponivel():
+    if ia_provedores.configurados() or _agente_disponivel():
         return True
     return False
 
-def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARIO_PADRAO):
-    """Core logic para responder IA, usado tanto pelo handler principal quanto pelo loop."""
+def montar_prompt_ia(sessao_id, usuario, historico_extra=None):
+    """Prompt de sistema completo: instrucoes do app + dossie do Taylor + historico."""
     mem = _load_mem(sessao_id)
     u = _load_usuario(usuario)
     perfil = u.get("perfil", [])
     historico = mem.get("historico", [])[-MAX_HISTORICO:]
 
     system_content = montar_instrucoes_ia()
+    contexto = _contexto_taylor()
+    if contexto:
+        system_content += "\n\n[Quem e o usuario - contexto permanente]\n" + contexto
     instr = str(u.get("instrucoes", "")).strip()
     if instr:
         system_content += "\n\n[Instrucoes permanentes do usuario (obedeca sempre)]:\n" + instr
@@ -508,23 +693,44 @@ def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARI
         for m in historico_extra:
             role = "Usuario" if m['role'] == 'user' else 'SPOOK'
             system_content += f"\n{role}: {str(m.get('content', ''))[:200]}"
+    return system_content
 
+
+def _resposta_local_livre(pergunta, sessao_id, usuario, historico_extra=None):
+    """Ultimo recurso quando a nuvem recusa: modelo local abliterado, sem tools."""
+    if not _agente_disponivel():
+        # o batimento da ponte e de 45 s; logo apos um restart pode estar velho
+        for _ in range(8):
+            time.sleep(0.5)
+            if _agente_disponivel():
+                break
+        else:
+            print("[IA] sem agente local para responder sem filtro", flush=True)
+            return None
+    try:
+        system = montar_prompt_ia(sessao_id, usuario, historico_extra)
+        return _perguntar_agente_arch(pergunta, usuario, sessao_id,
+                                      livre=True, system=system)
+    except Exception as erro:  # noqa: BLE001
+        print("[IA] modelo local sem filtro falhou: %s" % erro, flush=True)
+        return None
+
+
+def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARIO_PADRAO, modo=None):
+    """Core logic para responder IA, usado tanto pelo handler principal quanto pelo loop."""
+    # mem/historico sao devolvidos ao handler, que grava a conversa depois
+    mem = _load_mem(sessao_id)
+    historico = mem.get("historico", [])[-MAX_HISTORICO:]
+    system_content = montar_prompt_ia(sessao_id, usuario, historico_extra)
     mensagens = [{"role": "system", "content": system_content}, {"role": "user", "content": pergunta}]
 
-    resposta = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": GROQ_MODEL,
-            "messages": mensagens,
-            "max_tokens": 1024,
-            "temperature": 0.7,
-        },
-        timeout=45,
+    conteudo, provedor = ia_provedores.gerar(
+        mensagens,
+        max_tokens=1024,
+        temperatura=0.7,
+        modo=modo,
+        texto=pergunta,
     )
-    resposta.raise_for_status()
-    dados_resposta = resposta.json()
-    conteudo = dados_resposta["choices"][0]["message"]["content"].strip()
     if not conteudo:
         raise ValueError("Resposta vazia da IA")
 
@@ -579,11 +785,114 @@ def _responder_ia_core(pergunta, sessao_id, historico_extra=None, usuario=USUARI
     except Exception:
         pass
 
-    return conteudo, tool_call, mem, historico
+    print(f"[IA] motor={provedor} chars={len(conteudo)} "
+          f"tool_call={'sim' if tool_call else 'nao'}", flush=True)
+    return conteudo, tool_call, mem, historico, provedor
+
+
+ACAO_TIMEOUT_S = int(os.environ.get('SPOOK_IA_ACAO_TIMEOUT', '900'))
+
+
+def _vigiar_acao(sessao_id, espera=None):
+    """Se a ponte nunca devolver o resultado, libera o app com erro em vez de
+    deixar a sessao pendente para sempre (o app usa once() e ficaria mudo)."""
+    espera = espera or ACAO_TIMEOUT_S
+
+    def _alarme():
+        time.sleep(espera)
+        if _perguntas_pendentes.pop(sessao_id, None) is not None:
+            socketio.emit('chat_ia_resposta', {
+                'ok': False,
+                'resposta': f'A acao nao respondeu em {espera}s (notebook ou Termux fora do ar?).',
+                'sessao_id': sessao_id,
+            }, namespace='/ia')
+
+    threading.Thread(target=_alarme, daemon=True).start()
+
+
+
+def _formatar_resultado_acao(acao: str, resultado: dict) -> str:
+    """Formata o resultado de uma acao direta para resposta legivel."""
+    if acao == 'obter_tasks':
+        tasks = resultado.get('tasks', [])
+        if not tasks:
+            return "Nenhuma task encontrada."
+        linhas = ["Tasks:"]
+        for t in tasks:
+            status = "✓" if t.get('feito') else "○"
+            due = ""
+            if t.get('due_date'):
+                from datetime import datetime
+                dt = datetime.fromtimestamp(t['due_date'] / 1000)
+                due = f" (vence: {dt.strftime('%d/%m/%Y')})"
+            linhas.append(f"  {status} {t.get('titulo', 'sem titulo')}{due}")
+        return "\n".join(linhas)
+
+    if acao == 'criar_task':
+        task = resultado.get('task', {})
+        return f"Task criada: {task.get('titulo', 'sem titulo')} (ID: {task.get('id', '')[:8]})"
+
+    if acao == 'atualizar_task':
+        task = resultado.get('task', {})
+        return f"Task atualizada: {task.get('titulo', 'sem titulo')}"
+
+    if acao == 'apagar_task':
+        return "Task apagada."
+
+    if acao == 'obter_notas':
+        notas = resultado.get('notas', [])
+        if not notas:
+            return "Nenhuma nota encontrada."
+        linhas = ["Notas:"]
+        for n in notas:
+            if n.get('removido'):
+                continue
+            texto = n.get('texto', '')[:80]
+            if len(n.get('texto', '')) > 80:
+                texto += "..."
+            linhas.append(f"  - {n.get('titulo', 'sem titulo')}: {texto}")
+        return "\n".join(linhas)
+
+    if acao == 'criar_nota':
+        nota = resultado.get('nota', {})
+        return f"Nota criada: {nota.get('titulo', 'sem titulo')} (ID: {nota.get('id', '')[:8]})"
+
+    if acao == 'atualizar_nota':
+        nota = resultado.get('nota', {})
+        return f"Nota atualizada: {nota.get('titulo', 'sem titulo')}"
+
+    if acao == 'apagar_nota':
+        return "Nota apagada."
+
+    if acao == 'obter_financas':
+        expenses = resultado.get('expenses', [])
+        if not expenses:
+            return "Nenhuma despesa encontrada."
+        linhas = ["Despesas:"]
+        for e in expenses:
+            if e.get('removido'):
+                continue
+            total = sum(p.get('valor', 0) for p in e.get('parcelas', []))
+            linhas.append(f"  - {e.get('title', 'sem titulo')}: R$ {total:.2f} ({e.get('payment_method', '')})")
+        return "\n".join(linhas)
+
+    if acao == 'criar_expense':
+        expense = resultado.get('expense', {})
+        return f"Despesa criada: {expense.get('title', 'sem titulo')} (ID: {expense.get('id', '')[:8]})"
+
+    if acao == 'atualizar_parcela':
+        expense = resultado.get('expense', {})
+        return f"Parcela atualizada em: {expense.get('title', 'sem titulo')}"
+
+    if acao == 'apagar_expense':
+        return "Despesa apagada."
+
+    return f"Acao {acao} executada com sucesso."
 
 
 @socketio.on('chat_ia_perguntar', namespace='/ia')
 def responder_chat_ia(dados):
+    print(f"[RELAY] Received chat_ia_perguntar: {dados}, sid={request.sid}", flush=True)
     pergunta = str((dados or {}).get('pergunta', '')).strip()
     sessao_id = str((dados or {}).get('sessao_id', '')).strip() or request.sid
     usuario = str((dados or {}).get('usuario', '')).strip() or USUARIO_PADRAO
@@ -594,14 +903,36 @@ def responder_chat_ia(dados):
         emit('chat_ia_resposta', {'ok': False, 'resposta': 'Pergunta muito longa (maximo: 4000 caracteres).'})
         return
 
-    # 1) agente local no Arch (Ollama), quando o notebook esta online
-    if _agente_disponivel():
+    # 1) Arch (Ollama local) atende quando a pergunta e privada ou quando
+    #    nao existe provedor de nuvem configurado. Com nuvem disponivel ela
+    #    responde primeiro (modelo maior) e o Arch fica de reserva.
+    _modo_msg = (dados or {}).get('modo')
+    _privado, _motivo_priv = ia_provedores.decidir_privacidade(pergunta, _modo_msg)
+    _nuvem = ia_provedores.configurados()
+    if _privado:
+        _nuvem = [n for n in _nuvem if not ia_provedores.CATALOGO[n]['treina']]
+    _usar_arch = _agente_disponivel() and (_privado or not _nuvem)
+    if _usar_arch:
         try:
             resposta = _perguntar_agente_arch(pergunta, usuario, sessao_id)
         except Exception as erro:
             resposta = None
             print(f'[AGENTE] erro ao perguntar ao Arch: {erro}', flush=True)
         if resposta and resposta.get('ok'):
+            texto_local = str(resposta.get('resposta', '') or '')
+            # o agente ReAct usa o qwen2.5-coder, que tem filtro nos pesos.
+            # Se ele recusar, o modelo local SEM FILTRO responde.
+            if ia_provedores.parece_recusa(texto_local):
+                print('[IA] agente local recusou; tentando o modelo livre', flush=True)
+                livre = _resposta_local_livre(pergunta, sessao_id, usuario)
+                if livre and livre.get('ok'):
+                    emit('chat_ia_resposta', {
+                        'ok': True,
+                        'resposta': livre.get('resposta', ''),
+                        'sessao_id': sessao_id,
+                        'motor': 'local-livre',
+                    })
+                    return
             emit('chat_ia_resposta', {
                 'ok': True,
                 'resposta': resposta.get('resposta', ''),
@@ -609,20 +940,39 @@ def responder_chat_ia(dados):
                 'motor': 'local',
             })
             return
-        print('[AGENTE] sem resposta do Arch; caindo no Groq', flush=True)
+        print('[AGENTE] sem resposta do Arch; caindo no roteador de nuvem', flush=True)
 
-    if not GROQ_API_KEY:
-        emit('chat_ia_resposta', {'ok': False, 'resposta': 'Agente local offline (Arch desligado) e sem GROQ_API_KEY.'})
+    if not ia_provedores.configurados():
+        emit('chat_ia_resposta', {'ok': False, 'resposta': 'Agente local offline (Arch desligado) e nenhum provedor de IA configurado no relay (.env).'})
         return
 
     try:
-        conteudo, tool_call, mem, historico = _responder_ia_core(pergunta, sessao_id, usuario=usuario)
+        conteudo, tool_call, mem, historico, provedor = _responder_ia_core(
+            pergunta, sessao_id, usuario=usuario,
+            modo=_modo_msg,)
 
-        # Acao: NAO responde agora. O app usa once('chat_ia_resposta'); a
-        # resposta final unica vem de _continuar_acao() com o resultado.
+        # Acao: se a acao usa bridge (scan/comando/info), espera o resultado do Arch.
+        # Senao (tasks/notas/financas), devolve direto.
         if tool_call:
             _perguntas_pendentes[sessao_id] = {'pergunta': pergunta, 'usuario': usuario}
+            acao_nome = tool_call.get('acao', '')
             resultado = _executar_tool_call(tool_call, sessao_id)
+            if resultado.get('ok'):
+                if acao_nome in {'executar_comando_notebook', 'executar_scan', 'obter_info_sistema'}:
+                    _vigiar_acao(sessao_id)
+                    return
+                # Acao direta: devolve resultado agora
+                _perguntas_pendentes.pop(sessao_id, None)
+                # Formatar resposta legivel
+                resposta_texto = _formatar_resultado_acao(acao_nome, resultado)
+                emit('chat_ia_resposta', {
+                    'ok': True,
+                    'resposta': resposta_texto,
+                    'sessao_id': sessao_id,
+                    'usuario': usuario,
+                    'motor': provedor,
+                })
+                return
             if not resultado.get('ok'):
                 _perguntas_pendentes.pop(sessao_id, None)
                 emit('chat_ia_resposta', {
@@ -641,9 +991,42 @@ def responder_chat_ia(dados):
         _talvez_extrair_async(usuario, sessao_id, pergunta)
 
         emit('chat_ia_resposta', {'ok': True, 'resposta': conteudo,
-                                  'sessao_id': sessao_id, 'usuario': usuario})
+                                  'sessao_id': sessao_id, 'usuario': usuario,
+                                  'motor': provedor})
 
-    except requests.RequestException as erro:
+    except ia_provedores.IARecusada as erro:
+        # Todos os provedores de nuvem recusaram por politica. O modelo local
+        # abliterado (sem filtro) responde — e o unico caminho garantido.
+        print("[IA] recusa em todos os provedores: %s" % erro, flush=True)
+        resposta = _resposta_local_livre(pergunta, sessao_id, usuario)
+        if resposta and resposta.get('ok'):
+            emit('chat_ia_resposta', {
+                'ok': True,
+                'resposta': resposta.get('resposta', ''),
+                'sessao_id': sessao_id,
+                'motor': 'local-livre',
+            })
+            return
+        emit('chat_ia_resposta', {
+            'ok': False,
+            'resposta': 'Nenhum provedor de nuvem respondeu (recusa ou sem cota) e o modelo local sem filtro nao respondeu (Arch desligado?).',
+            'sessao_id': sessao_id,
+        })
+    except (requests.RequestException, ia_provedores.IAIndisponivel) as erro:
+        # ultima tentativa: Ollama local no Arch, se estiver online
+        if not _usar_arch and _agente_disponivel():
+            try:
+                resposta = _perguntar_agente_arch(pergunta, usuario, sessao_id)
+            except Exception:
+                resposta = None
+            if resposta and resposta.get('ok'):
+                emit('chat_ia_resposta', {
+                    'ok': True,
+                    'resposta': resposta.get('resposta', ''),
+                    'sessao_id': sessao_id,
+                    'motor': 'local',
+                })
+                return
         emit('chat_ia_resposta', {'ok': False, 'resposta': f'Falha na IA: {erro}'})
     except (KeyError, IndexError, TypeError, ValueError):
         emit('chat_ia_resposta', {'ok': False, 'resposta': 'Resposta invalida da IA.'})
@@ -657,6 +1040,16 @@ def ia_resultado_acao(dados):
         (dados or {}).get('resultado', {}),
         (dados or {}).get('pergunta_original', ''),
     )
+
+
+def _continuar_em_thread(sessao_id, resultado, pergunta_original):
+    """O resultado da acao chega pela ponte (namespace default). Aqui e o
+    UNICO caminho que fecha o loop: socketio.emit('ia_resultado_acao', ...,
+    namespace='/ia') entrega so a CLIENTES, nunca ao handler do proprio
+    servidor — era por isso que a IA ficava muda depois de um scan."""
+    threading.Thread(target=_continuar_acao,
+                     args=(sessao_id, resultado, pergunta_original),
+                     daemon=True).start()
 
 
 def _continuar_acao(sessao_id, resultado, pergunta_original):
@@ -680,7 +1073,7 @@ def _continuar_acao(sessao_id, resultado, pergunta_original):
             {"role": "user", "content": f"Resultado da acao: {json.dumps(resultado, ensure_ascii=False)}"},
             {"role": "assistant", "content": pergunta_original or "Continue."}
         ]
-        conteudo, tool_call, mem, historico = _responder_ia_core(
+        conteudo, tool_call, mem, historico, provedor = _responder_ia_core(
             f"Resultado da acao: {json.dumps(resultado, ensure_ascii=False)}\nAgora responda ao usuario.",
             sessao_id,
             historico_extra,
@@ -695,8 +1088,27 @@ def _continuar_acao(sessao_id, resultado, pergunta_original):
         _talvez_extrair_async(usuario, sessao_id, pergunta_original or "")
 
         socketio.emit("chat_ia_resposta", {"ok": True, "resposta": conteudo,
-                                           "sessao_id": sessao_id, "usuario": usuario}, namespace="/ia")
+                                           "sessao_id": sessao_id, "usuario": usuario,
+                                           "motor": provedor}, namespace="/ia")
 
+    except ia_provedores.IARecusada:
+        resposta = _resposta_local_livre(
+            "Resultado da acao: " + json.dumps(resultado, ensure_ascii=False)
+            + "\nAgora responda ao usuario.",
+            sessao_id, usuario)
+        if resposta and resposta.get('ok'):
+            socketio.emit("chat_ia_resposta", {
+                "ok": True,
+                "resposta": resposta.get('resposta', ''),
+                "sessao_id": sessao_id,
+                "usuario": usuario,
+                "motor": "local-livre",
+            }, namespace="/ia")
+            return
+        socketio.emit("chat_ia_resposta", {
+            "ok": False,
+            "resposta": "A IA recusou o resultado da acao e o modelo local nao respondeu.",
+        }, namespace="/ia")
     except Exception as e:
         socketio.emit("chat_ia_resposta", {"ok": False, "resposta": f"Falha ao processar resultado: {e}"}, namespace="/ia")
 
@@ -721,6 +1133,10 @@ def connect(auth=None):
         socketio.emit('celular_presenca', {'online': True})
     else:
         emit('celular_presenca', {'online': bool(_remoto_sids)})
+
+@socketio.on('celular_presenca_pedir')
+def celular_presenca_pedir():
+    emit('celular_presenca_resposta', {'online': bool(_remoto_sids)})
 
 @socketio.on('disconnect')
 def ao_desconectar():
@@ -772,6 +1188,18 @@ def task_atualizada(dados):
     lista = hub_store.marcar_task(tid, feito, due_date=due_date)
     t = next((x for x in lista if x['id'] == tid), None)
     if t:
+        socketio.emit('task_atualizada', t)
+
+@socketio.on('task_due_date')
+def task_due_date(dados):
+    tid = (dados or {}).get('id')
+    due = int((dados or {}).get('due_date') or 0)
+    if not tid:
+        return
+    lista = hub_store.atualizar_task_due_date(tid, due)
+    t = next((x for x in lista if x['id'] == tid), None)
+    if t:
+        emit('task_atualizada', t)
         socketio.emit('task_atualizada', t)
 
 @socketio.on('task_apagada')
@@ -886,7 +1314,7 @@ def ia_executar_scan(dados):
     resultado = dados.get('resultado', {})
     pergunta_original = (dados or {}).get('pergunta_original', '')
     if sessao_id and resultado:
-        socketio.emit('ia_resultado_acao', {'sessao_id': sessao_id, 'resultado': resultado, 'pergunta_original': pergunta_original}, namespace='/ia')
+        _continuar_em_thread(sessao_id, resultado, pergunta_original)
 
 @socketio.on('ia_executar_comando')
 def ia_executar_comando(dados):
@@ -894,7 +1322,7 @@ def ia_executar_comando(dados):
     resultado = dados.get('resultado', {})
     pergunta_original = (dados or {}).get('pergunta_original', '')
     if sessao_id and resultado:
-        socketio.emit('ia_resultado_acao', {'sessao_id': sessao_id, 'resultado': resultado, 'pergunta_original': pergunta_original}, namespace='/ia')
+        _continuar_em_thread(sessao_id, resultado, pergunta_original)
 
 @socketio.on('ia_obter_info')
 def ia_obter_info(dados):
@@ -902,7 +1330,7 @@ def ia_obter_info(dados):
     resultado = dados.get('resultado', {})
     pergunta_original = (dados or {}).get('pergunta_original', '')
     if sessao_id and resultado:
-        socketio.emit('ia_resultado_acao', {'sessao_id': sessao_id, 'resultado': resultado, 'pergunta_original': pergunta_original}, namespace='/ia')
+        _continuar_em_thread(sessao_id, resultado, pergunta_original)
 
 # Media upload / serve
 # Media upload / serve
@@ -1408,8 +1836,10 @@ def rota_finance_calendario():
 def rota_criar_expense():
     if not _auth_ok():
         return {'ok': False, 'erro': 'Unauthorized'}, 401
-    d = request.get_json(silent=True) or {}
-    if not d.get('title') and not d.get('titulo'):
+    # O overlay do Arch manda {"description": ...} (camelCase): normaliza antes
+    # de validar, senao todo create vindo do notebook dava 400.
+    d = hub_store._normaliza_expense(request.get_json(silent=True) or {})
+    if not d.get('title') and not d.get('titulo') and not d.get('description'):
         return {'ok': False, 'erro': 'title_obrigatorio'}, 400
     try:
         nova, _ = hub_store.criar_expense(d)
@@ -1613,6 +2043,16 @@ def rota_apagar_relatorios():
 def _ia_token_ok() -> bool:
     auth = request.headers.get("Authorization", "")
     return _token_igual(auth.replace("Bearer ", "").strip())
+
+
+@app.route("/ia/provedores")
+def ia_provedores_http():
+    """Diagnostico do roteador: ordem, modelo e cooldown. Nao expoe chaves."""
+    if not _ia_token_ok():
+        return {"ok": False, "erro": "Unauthorized"}, 401
+    corpo = {"ok": True, "agente_arch_online": _agente_disponivel()}
+    corpo.update(ia_provedores.estado())
+    return corpo
 
 
 @app.route("/ia/memoria")
