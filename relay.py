@@ -11,6 +11,7 @@ import json
 from datetime import datetime, timezone
 import hub_store
 import pad_store
+import horas_store
 import fcntl
 import ia_provedores
 
@@ -1135,7 +1136,11 @@ def connect(auth=None):
         emit('celular_presenca', {'online': bool(_remoto_sids)})
 
 @socketio.on('celular_presenca_pedir')
-def celular_presenca_pedir():
+def celular_presenca_pedir(dados=None):
+    # O overlay emite com payload (`emit("celular_presenca_pedir", {})`), e o
+    # python-socketio repassa esse argumento ao handler. Sem o parametro aqui
+    # todo pedido estourava TypeError e a resposta nunca saia (57 ocorrencias
+    # no journal desde 08/11/2026).
     emit('celular_presenca_resposta', {'online': bool(_remoto_sids)})
 
 @socketio.on('disconnect')
@@ -2166,6 +2171,49 @@ def rota_restaurar_pad(nid):
         return {'ok': False, 'erro': 'Unauthorized'}, 401
     d = request.get_json(silent=True) or {}
     res = pad_store.restaurar(nid, int(d.get('em') or 0), d.get('device', 'android'))
+    return res
+
+# =============================== HORAS TRABALHADAS ================================
+# Um arquivo por dia em gdrive:SPOOK/horas/<YYYY-MM-DD>.json (mesmo desenho do PAD).
+@app.route('/horas', methods=['GET'])
+def rota_listar_horas():
+    if not _auth_ok():
+        return {'ok': False, 'erro': 'Unauthorized'}, 401
+    return {'ok': True, 'dias': horas_store.listar()}
+
+@app.route('/horas/<hid>', methods=['GET'])
+def rota_obter_horas(hid):
+    if not _auth_ok():
+        return {'ok': False, 'erro': 'Unauthorized'}, 401
+    rec = horas_store.obter(hid)
+    if not rec:
+        return {'ok': False, 'erro': 'nao_encontrado'}, 404
+    return {'ok': True, 'dia': rec}
+
+@app.route('/horas/<hid>', methods=['POST'])
+def rota_salvar_horas(hid):
+    if not _auth_ok():
+        return {'ok': False, 'erro': 'Unauthorized'}, 401
+    d = request.get_json(silent=True) or {}
+    d['id'] = hid
+    res = horas_store.salvar(d)
+    if not res.get('ok'):
+        return res, 400
+    try:
+        socketio.emit('horas_atualizada', res.get('dia'))
+    except Exception:
+        pass
+    return {'ok': True, 'dia': res.get('dia'), 'antiga': bool(res.get('antiga'))}
+
+@app.route('/horas/<hid>', methods=['DELETE'])
+def rota_apagar_horas(hid):
+    if not _auth_ok():
+        return {'ok': False, 'erro': 'Unauthorized'}, 401
+    res = horas_store.apagar(hid, request.args.get('device', 'android'))
+    try:
+        socketio.emit('horas_apagada', {'id': hid})
+    except Exception:
+        pass
     return res
 
 @app.route('/healthz')

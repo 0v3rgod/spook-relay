@@ -248,6 +248,7 @@ def _loop():
         time.sleep(1)
         _sync_tasks()
         _aaplica_pendentes_locais()  # garante que nada nosso sumiu do espelho
+        _sincronizar_finance()       # self-throttle: no-op quando nao ha pendente
         time.sleep(max(2, _REFRESHER_INTERVAL - 1))
 
 
@@ -896,6 +897,93 @@ def _gravar_finance_local(expense):
         (_FINANCE_DIR / f"{expense['id']}.json").write_text(json.dumps(expense, ensure_ascii=False))
     except Exception:
         pass
+
+
+# ---- subida das financas para o Drive ------------------------------------
+# O relay e' a fonte da verdade das financas, mas ate 11/11/2026 NADA subia
+# para gdrive:SPOOK/finance: o upload vivia no _sync_finance() do hub_store do
+# Arch, que saiu de cena na migracao para o relay. O _fpin() so acumulava em
+# spook_finance_pending.json (ninguem consumia) e o Drive ficou congelado em
+# 07/11 — 6 das 12 despesas existiam apenas no disco da VM.
+_FIN_INTERVALO = float(os.environ.get("SPOOK_FINANCE_SYNC", "15"))
+_FIN_ULTIMO = [0.0]
+
+
+def _pin_finance():
+    """Garante que todo pendente existe como ARQUIVO no espelho local.
+
+    O fluxo normal (_gravar_finance_local + _fpin) ja cria os dois; isto cobre
+    o registro que chegou por outro caminho, senao o rclone copy nao o veria."""
+    try:
+        for fid, rec in _fcarregar().items():
+            if rec.get("__del"):
+                continue
+            if not (_FINANCE_DIR / f"{fid}.json").exists():
+                _gravar_finance_local({**rec, "id": fid})
+    except Exception:
+        pass
+
+
+def _sincronizar_finance(intervalo=None, forcar=False):
+    """Sobe o espelho local de financas para o Drive.
+
+    Usa `rclone copy` e NUNCA `sync`: sync apagaria do Drive qualquer arquivo
+    que nao estivesse no espelho local, e o espelho da VM e' reconstruivel a
+    qualquer momento (perder despesa e' pior que deixar resto). copy so
+    cria/atualiza.
+
+    Diferente de chat/tasks, aqui a confirmacao pelo listing NAO e' obrigatoria:
+    nada poda o espelho local de financas (nao ha sync de entrada), entao um
+    pendente liberado cedo demais nao tem como desaparecer do disco.
+    """
+    agora = time.time()
+    if not forcar:
+        if intervalo is None:
+            intervalo = _FIN_INTERVALO
+        if agora - _FIN_ULTIMO[0] < intervalo:
+            return False
+        if not _fcarregar():
+            return False
+    _pin_finance()
+    _FIN_ULTIMO[0] = agora
+    fdu = _upload_lock()
+    try:
+        p = _run(["copy", "--update", "--fast-list", str(_FINANCE_DIR), _base("finance")],
+                 check=False, timeout=180)
+        if p.returncode != 0:
+            return False
+    except Exception:
+        return False
+    finally:
+        fcntl.flock(fdu, fcntl.LOCK_UN)
+        fdu.close()
+
+    fd = _fpend_lock()
+    if fd is None:
+        return True
+    try:
+        pend = _fcarregar()
+        saiu = []
+        for fid, rec in pend.items():
+            if rec.get("__del"):
+                try:
+                    _run(["deletefile", f"{_base('finance')}/{fid}.json"],
+                         check=False, timeout=60)
+                    if not _remoto_tem(f"finance/{fid}.json"):
+                        saiu.append(fid)
+                except Exception:
+                    pass
+            elif (_FINANCE_DIR / f"{fid}.json").exists():
+                saiu.append(fid)  # acabou de ser copiado para o Drive
+        if saiu:
+            for fid in saiu:
+                pend.pop(fid, None)
+            _fsalvar(pend)
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        fd.close()
+    return True
+
 
 def _ler_cache_finance():
     """Le o cache de despesas do arquivo local."""
